@@ -1,0 +1,98 @@
+Do you know what speculative decoding is?now i want to implememt speculative decoding,small model is qwen3-0.8B, big model is qwen3-0.8B(temporal for test),Please first help me sort out the core challenges of speculative decoding,Starting from version v0.5.0, vLLM supports speculative decoding. For implementation, you can refer to vllm,But it should be based on the idea of this project。Last，Is the following correct? If so, please pay attention： 1. Sampling algorithm, 2. Independent management of kv cache. If the hidden size is the same, the kv cache of the draft model can be directly reused. 3. Rollback mechanism: When the inference fails, the kv cache can be restored to the correct state. 4: Check whether Tree inference is supported, Token Tree Verification. If so, what conditions are required and implement them.
+Yes, I know speculative decoding well. Let me first read the existing codebase to ground the analysis, then address your questions.
+
+Read scheduler.py
+Read sequence.py
+Read block_manager.py
+Good, I've read the core engine. Let me give you a thorough analysis before any implementation.
+
+Speculative Decoding: Core Concept
+The draft model autoregressively generates K candidate tokens cheaply. The target model then verifies all K tokens in a single parallel forward pass (like a prefill). Accepted tokens are kept; the first rejected token is resampled from the target distribution, and the rest are discarded. Net result: you get 1–K tokens per target model step instead of 1.
+
+Core Challenges (grounded in this codebase)
+1. Two-Model Orchestration
+The engine currently has one ModelRunner. You need two running simultaneously — draft and target — with coordinated scheduling. The draft runs K decode steps, then the target runs one prefill-like verification step. This breaks the current schedule() → run → postprocess loop entirely.
+
+2. Verification Step is a New Execution Mode
+The target model's verification pass is neither a standard prefill nor a standard decode. It's a mixed-length prefill: each sequence contributes exactly K new tokens (the draft tokens), but attends to its full KV cache context. The current prepare_prefill / prepare_decode split doesn't cover this — you need a third path.
+
+3. Scheduler Must Handle Variable Token Acceptance
+postprocess currently appends exactly 1 token per sequence. With speculative decoding, each sequence may accept 0–K tokens per step. The scheduler's token budget accounting (max_num_batched_tokens) and block allocation (can_append / append) both assume 1 token at a time. You need bulk-append support.
+
+4. Draft Model KV Cache Rollback
+After verification, rejected draft tokens must be erased from the draft model's KV cache. The current BlockManager has no rollback — deallocate frees entire sequences, not partial tails. You need a rollback(seq, n_tokens) operation that frees the last n tokens' worth of KV slots without touching the accepted prefix.
+
+5. CUDA Graph Incompatibility
+The current decode path uses pre-captured CUDA graphs at fixed batch sizes. Speculative decoding changes the input shape every step (K draft tokens per sequence for verification), making static CUDA graphs much harder to use for the verification pass. Draft decode steps can still use graphs, but verification likely needs eager mode or a separate graph capture strategy.
+
+Your Four Points — Assessment
+1. Sampling Algorithm — Correct, and critical
+Standard greedy/temperature sampling is wrong for speculative decoding. You must use the rejection sampling algorithm from the original paper (Leviathan et al. 2023):
+
+For each draft token x_i with draft probability q(x_i) and target probability p(x_i):
+
+Accept with probability min(1, p(x_i) / q(x_i))
+If rejected: resample from the residual distribution norm(max(0, p(x) - q(x)))
+This guarantees the output distribution is identical to sampling from the target model alone. If you use greedy draft + greedy target, you can simplify to: accept if argmax(target) == draft_token, but this only works for temperature=0.
+
+The draft model must therefore return logits (not just token ids) so you can compute q(x_i). The target model's verification pass must also return per-position logits for all K positions.
+
+2. KV Cache Reuse — Correct in principle, but needs care
+If draft and target share the same hidden_size, num_kv_heads, head_dim, and num_layers, the KV cache tensors are the same shape and can be shared. For Qwen3-0.6B vs Qwen3-0.6B (your test case) this is trivially true.
+
+However, the KV cache values are not the same — each model computes different K/V projections from the same hidden states. So you cannot share the actual KV data, only the block allocation structure (same BlockManager, same block_table per sequence). The GPU tensors for draft KV and target KV must be separate allocations.
+
+The practical benefit: you can use the same BlockManager to track both, with the draft's blocks being a "speculative extension" of the target's confirmed blocks.
+
+3. Rollback Mechanism — Correct, and the hardest part
+This is the most invasive change to the existing codebase. After verification accepts m out of K draft tokens:
+
+Target KV cache: already correct (verification wrote KV for accepted positions only, or you need to be careful about what the verification pass wrote)
+Draft KV cache: has K extra tokens that need to be trimmed to m
+The current BlockManager.append() only moves forward. You need:
+
+
+def rollback(self, seq: Sequence, n_accepted: int) -> None:
+    # Remove KV slots for the last (K - n_accepted) tokens
+    # May need to free partially-filled blocks
+    # Must update seq.num_tokens and seq.block_table accordingly
+The tricky edge case: if the rollback crosses a block boundary (e.g., K=5, block_size=256, and you're near a block boundary), you may need to free an entire block that was just allocated.
+
+In vLLM, this is handled by tracking a "speculative" block table separately from the "confirmed" block table, and only merging on acceptance.
+
+4. Token Tree Verification — Correct direction, but conditional
+Standard speculative decoding (what you described above) is a special case of tree verification with a chain (linear tree, branching factor=1).
+
+Token Tree Verification (vLLM's SpecDecodeWorker with TopKProposals) generates a tree of draft candidates: at each position, the draft model proposes the top-K tokens, creating a branching tree. The target model verifies all tree nodes in one pass using tree attention (a masked attention where each node only attends to its ancestors).
+
+Requirements for tree verification in this codebase:
+
+Tree attention mask: the attention kernel must support an arbitrary causal mask, not just the standard lower-triangular one. The current FlashAttention call uses causal=True which is a fixed mask — you'd need to pass a custom mask or use a different kernel.
+Multiple draft sequences per input sequence: the scheduler and sequence representation need to handle branching.
+Tree sampling: the rejection sampling algorithm generalizes to trees but is more complex.
+Recommendation: Start with linear speculative decoding (chain, K=5). Tree verification is a significant additional complexity and the gains over linear are marginal for most use cases. vLLM only added it in v0.5.0 and it's still experimental.
+
+Proposed Implementation Approach (vLLM-style, adapted to this project)
+The cleanest split that respects this project's architecture:
+
+
+
+
+SpecDecodeEngine
+  ├── draft_runner: ModelRunner  (existing, loaded with draft model)
+  ├── target_runner: ModelRunner (existing, loaded with target model)
+  ├── draft_block_manager: BlockManager  (separate, for draft KV)
+  ├── target_block_manager: BlockManager (existing scheduler's)
+  └── spec_scheduler: SpecScheduler
+        step():
+          1. draft_runner.run_draft(seqs, K)  → draft_tokens[K], draft_logits[K]
+          2. target_runner.run_verify(seqs, draft_tokens)  → target_logits[K+1]
+          3. rejection_sample(draft_logits, target_logits)  → accepted_tokens, n_accepted
+          4. rollback draft KV to n_accepted
+          5. append accepted_tokens to seqs (bulk)
+          6. check stopping conditions
+The key new files needed:
+
+engine/spec_scheduler.py — wraps the step loop above
+engine/rejection_sampler.py — the sampling algorithm
+engine/block_manager.py — add rollback() method
