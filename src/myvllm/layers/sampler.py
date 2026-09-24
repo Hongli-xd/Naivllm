@@ -12,7 +12,8 @@ class SamplerLayer(nn.Module):
         super().__init__()
 
     def forward(self, logits: torch.Tensor, temperature: torch.Tensor) -> torch.Tensor:
-        logits/= temperature.unsqueeze(-1)
-        probs = torch.softmax(logits, dim=-1)
-        sample_tokens = probs.div_(torch.empty_like(probs).exponential_(1).clamp_min_(1e-10)).argmax(dim=-1)
+        scaled_logits = logits / temperature.unsqueeze(-1)
+        probs = torch.softmax(scaled_logits, dim=-1)
+        noise = torch.empty_like(probs).exponential_(1).clamp_min_(1e-10)
+        sample_tokens = (probs / noise).argmax(dim=-1)
         return sample_tokens
