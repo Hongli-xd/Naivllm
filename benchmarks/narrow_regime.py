@@ -141,8 +141,11 @@ class VllmBackend:
                 ttfts.append(first - arrival)
         return {
             "total_s": total_s,
-            "ttft_p50_s": statistics.median(ttfts) if ttfts else 0.0,
-            "ttft_p99_s": percentile(ttfts, 0.99),
+            # Offline ``LLM.generate`` does not expose per-request TTFT in
+            # vLLM 0.23. Use the measured request wall time as a conservative
+            # fallback rather than emitting a misleading zero.
+            "ttft_p50_s": statistics.median(ttfts) if ttfts else total_s,
+            "ttft_p99_s": percentile(ttfts, 0.99) if ttfts else total_s,
             "output_tokens": sum(len(item.outputs[0].token_ids) for item in outputs),
             "cache": None,
         }
