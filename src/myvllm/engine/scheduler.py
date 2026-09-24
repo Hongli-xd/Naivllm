@@ -81,7 +81,7 @@ class Scheduler:
             # Reached max_tokens limit (number of completion tokens)
             # Reached max_model_length limit (total sequence length including prompt)
             stop_due_to_eos = not seq.ignore_eos and token_id == self.eos
-            stop_due_to_max_tokens = 1 + seq.num_completion_tokens >= seq.max_tokens
+            stop_due_to_max_tokens = seq.num_completion_tokens >= seq.max_tokens
             stop_due_to_max_length = seq.max_model_length is not None and seq.num_tokens >= seq.max_model_length
 
             if stop_due_to_eos or stop_due_to_max_tokens or stop_due_to_max_length:

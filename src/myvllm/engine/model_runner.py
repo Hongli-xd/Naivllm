@@ -38,6 +38,16 @@ class ModelRunner:
         dist.init_process_group('nccl', "tcp://localhost:12345", world_size=config['world_size'], rank=rank)
         torch.cuda.set_device(rank)
 
+        dtype_name = config.get("dtype", "bfloat16")
+        try:
+            self.default_dtype = getattr(torch, dtype_name)
+        except AttributeError as exc:
+            raise ValueError(f"Unsupported dtype: {dtype_name}") from exc
+        if self.default_dtype not in (torch.float16, torch.bfloat16, torch.float32):
+            raise ValueError(f"Unsupported model dtype: {self.default_dtype}")
+        original_dtype = torch.get_default_dtype()
+        torch.set_default_dtype(self.default_dtype)
+
         # set model
         self.model = Qwen3ForCausalLM(
             vocab_size=config['vocab_size'],
@@ -70,9 +80,6 @@ class ModelRunner:
 
         self.sampler = SamplerLayer()
 
-        # Store default dtype before it's needed in allocate_kv_cache
-        self.default_dtype = torch.get_default_dtype()
-
         # Debug flag for first decode step
         self._first_decode = False
 
@@ -93,8 +100,7 @@ class ModelRunner:
         if not self.enforce_eager:
             self.capture_cudagraph()
 
-        torch.set_default_device(f'cuda:{rank}')
-        torch.set_default_dtype(self.default_dtype)
+        torch.set_default_dtype(original_dtype)
 
         # IMPORTANT: Set up shared memory and barrier AFTER all model initialization
         # This ensures both ranks complete warmup/allocation before rank 1 enters its event loop
@@ -212,7 +218,10 @@ class ModelRunner:
         # compute the actual byte required of each block
         # Query是"当前"的，Key和Value是"历史"的
         block_bytes = self.block_size * 2 * num_layers * num_kv_heads * head_dim * self.default_dtype.itemsize
-        self.num_available_kv_blocks = int(available_mem // block_bytes)
+        memory_limited_blocks = int(available_mem // block_bytes)
+        self.num_available_kv_blocks = min(
+            memory_limited_blocks, self.config["max_cached_blocks"]
+        )
         assert self.num_available_kv_blocks >= 1, f'Not enough memory to hold at least one block of KV cache on rank {self.rank}'
 
         # allocate max possible kv cache for the model, instead for each sequence
@@ -307,6 +316,8 @@ class ModelRunner:
             slot_mapping=slot_mapping_tensor,
             context_lens=None,
             block_tables=torch.tensor(block_tables, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True) if block_tables else None,
+            seqlens_q=seqlens_q,
+            seqlens_k=seqlens_k,
         )
         return input_ids
 
@@ -348,11 +359,20 @@ class ModelRunner:
     # allocate input_ids, positions, slot_mapping, context_lens, block_tables, outputs
     # into graph_variable, and then replay the graph
     @torch.inference_mode()
-    def run_model(self, input_ids: torch.Tensor, is_prefill: bool) -> torch.Tensor:
+    def run_model(
+        self,
+        input_ids: torch.Tensor,
+        is_prefill: bool,
+        temperatures: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         if is_prefill or self.enforce_eager:
             # For varlen prefill, keep input_ids as 1D (concatenated tokens)
             # Do NOT unsqueeze - flash_attn_varlen_func expects 1D input with cu_seqlens
             hidden_states = self.model(input_ids)
+            if is_prefill:
+                context = get_context()
+                last_token_indices = context.cu_seqlens_q[1:].long() - 1
+                hidden_states = hidden_states[last_token_indices]
             logits = self.model.compute_logits(hidden_states)
         else:
             bs = input_ids.size(0)
@@ -367,10 +387,12 @@ class ModelRunner:
             vars['slot_mapping'][:bs].copy_(context.slot_mapping)
             vars["context_lens"].zero_()
             vars['context_lens'][:bs].copy_(context.context_lens)
+            vars["block_tables"].fill_(-1)
             vars["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
+            vars["temperatures"][:bs].copy_(temperatures)
             # replay the graph
             graph.replay()
-            logits = self.model.compute_logits(vars['outputs'][:bs])
+            logits = vars['outputs'][:bs]
 
         return logits
 
@@ -385,11 +407,15 @@ class ModelRunner:
             input_ids = self.prepare_prefill(seqs)
         else:
             input_ids = self.prepare_decode(seqs)
-        logits = self.run_model(input_ids, is_prefill)
+        temperatures = self.prepare_sample(seqs)
+        logits_or_tokens = self.run_model(input_ids, is_prefill, temperatures)
         # only sample when rank == 0
         token_ids = None
         if self.rank == 0:
-            token_ids = self.sampler(logits, self.prepare_sample(seqs))
+            if is_prefill or self.enforce_eager:
+                token_ids = self.sampler(logits_or_tokens, temperatures)
+            else:
+                token_ids = logits_or_tokens
         reset_context()
         return token_ids
 
@@ -401,7 +427,7 @@ class ModelRunner:
     # (later use graph.replay() to run the captured graph)
     @torch.inference_mode()
     def capture_cudagraph(self) -> None:
-        max_bs = self.config['max_num_seqs']
+        max_bs = self.config['max_num_sequences']
         max_len = self.config['max_model_length']
         max_num_blocks = math.ceil(max_len / self.block_size)
         # for decoding, input is always of shape (batch_size, 1)
@@ -413,11 +439,13 @@ class ModelRunner:
         context_lens = torch.zeros(max_bs, dtype=torch.long, device=f'cuda:{self.rank}')
         # where to read KV values in the cache
         block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32, device=f'cuda:{self.rank}')
-        # output logits
-        outputs = torch.zeros(max_bs, self.config['vocab_size'], device=f'cuda:{self.rank}')
+        temperatures = torch.ones(max_bs, dtype=torch.float32, device=f'cuda:{self.rank}')
+        outputs = torch.zeros(max_bs, dtype=torch.long, device=f'cuda:{self.rank}')
 
         # graphs to be captured for different batch sizes
-        batch_sizes = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
+        batch_sizes = sorted(
+            {size for size in [1, 2, 4, 8, *range(16, max_bs + 1, 16), max_bs] if size <= max_bs}
+        )
         self.graphs = {}
         graph_pool = None
 
@@ -433,10 +461,16 @@ class ModelRunner:
                 context_lens=context_lens[:batch_size],
                 block_tables=block_tables[:batch_size],
             )
-            outputs[:batch_size] = self.model(input_ids[:batch_size])
+            hidden_states = self.model(input_ids[:batch_size])
+            logits = self.model.compute_logits(hidden_states)
+            if self.rank == 0:
+                outputs[:batch_size] = self.sampler(logits, temperatures[:batch_size])
 
             with torch.cuda.graph(graph, graph_pool):
-                outputs[:batch_size] = self.model(input_ids[:batch_size])
+                hidden_states = self.model(input_ids[:batch_size])
+                logits = self.model.compute_logits(hidden_states)
+                if self.rank == 0:
+                    outputs[:batch_size] = self.sampler(logits, temperatures[:batch_size])
                 if graph_pool is None:
                     graph_pool = graph.pool()
             # store the captured graph
@@ -451,5 +485,6 @@ class ModelRunner:
             slot_mapping=slot_mapping,
             context_lens=context_lens,
             block_tables=block_tables,
+            temperatures=temperatures,
             outputs=outputs,
         )

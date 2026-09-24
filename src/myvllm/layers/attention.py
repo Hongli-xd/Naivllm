@@ -209,10 +209,12 @@ def flash_attention_varlen_kernel(
         # K pointers: K has shape (total_tokens, num_kv_heads, head_dim)
         # 最终形状: [head_dim, BLOCK_N]
         # K 指针：形状 [head_dim, BLOCK_N]  ← 注意！行列互换了
-        k_ptrs = K + (seq_start + offs_n[None, :]) * num_kv_heads * head_dim
-                                # ↑ 变成列维度了！
-        + offs_d[:, None]
-               # ↑ 变成行维度了！
+        k_ptrs = (
+            K
+            + (seq_start + offs_n[None, :]) * num_kv_heads * head_dim
+            + kv_head_idx * head_dim
+            + offs_d[:, None]
+        )
         # q_ptrs = Q + (seq_start + offs_m[:, None]) * num_heads * head_dim + off_h * head_dim + offs_d[None, :]
         # Load K block - shape (head_dim, BLOCK_N)
         k = tl.load(k_ptrs, mask=mask_n[None, :], other=0.0)
@@ -323,6 +325,44 @@ def flash_attention_prefill(
     return output
 
 
+def paged_attention_prefill(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    block_tables: torch.Tensor,
+    seqlens_q: list[int],
+    seqlens_k: list[int],
+    scale: float,
+    num_heads: int,
+    num_kv_heads: int,
+    block_size: int,
+) -> torch.Tensor:
+    """Correctness path for prefill requests that reuse cached prefix blocks."""
+    outputs = []
+    q_start = 0
+    heads_per_kv = num_heads // num_kv_heads
+    for seq_idx, (q_len, k_len) in enumerate(zip(seqlens_q, seqlens_k)):
+        q_seq = q[q_start : q_start + q_len]
+        positions = torch.arange(k_len, device=q.device)
+        logical_blocks = torch.div(positions, block_size, rounding_mode="floor")
+        block_offsets = positions % block_size
+        physical_blocks = block_tables[seq_idx, logical_blocks].long()
+        k_seq = k_cache[physical_blocks, block_offsets]
+        v_seq = v_cache[physical_blocks, block_offsets]
+        k_seq = k_seq.repeat_interleave(heads_per_kv, dim=1)
+        v_seq = v_seq.repeat_interleave(heads_per_kv, dim=1)
+
+        scores = torch.einsum("qhd,khd->hqk", q_seq, k_seq).float() * scale
+        cached_tokens = k_len - q_len
+        query_positions = cached_tokens + torch.arange(q_len, device=q.device)
+        causal = positions.unsqueeze(0) <= query_positions.unsqueeze(1)
+        scores.masked_fill_(~causal.unsqueeze(0), torch.finfo(scores.dtype).min)
+        probabilities = torch.softmax(scores, dim=-1).to(v_seq.dtype)
+        outputs.append(torch.einsum("hqk,khd->qhd", probabilities, v_seq))
+        q_start += q_len
+    return torch.cat(outputs, dim=0)
+
+
 @triton.jit
 def paged_attention_decode_kernel(
     output_ptr,
@@ -379,37 +419,20 @@ def paged_attention_decode_kernel(
             mask_n = offs_n < context_len
             
           
-            # Compute attention scores for this chunk
-            qk = tl.zeros([BLOCK_N], dtype=tl.float32) - 1e10
-            
-            # Load K for each valid position and compute scores
-            for i in range(BLOCK_N):
-                token_idx = token_start + i
-                if token_idx < context_len:
-                    block_num = token_idx // block_size
-                    block_offset = token_idx % block_size
-                    
-                    if block_num < max_num_blocks:
-                        # Look up physical block
-                        block_table_offset = batch_idx * max_num_blocks + block_num
-                        physical_block_idx = tl.load(block_tables_ptr + block_table_offset)
-                        
-                        if physical_block_idx != -1:
-                            # Load K
-                            k_offset = (physical_block_idx * block_size * num_kv_heads * head_dim +
-                                       block_offset * num_kv_heads * head_dim +
-                                       kv_head_idx * head_dim + offs_d)
-                            k_vec = tl.load(k_cache_ptr + k_offset)
-                            
-                            # Compute score for this token
-                            score = tl.sum(q * k_vec) * scale
-                            
-                            # Update qk array at position i using tl.where
-                            mask_i = tl.arange(0, BLOCK_N) == i
-                            qk = tl.where(mask_i, score, qk)
-            
-            # Apply mask to invalid positions
-            qk = tl.where(mask_n, qk, -1e10)
+            block_num = offs_n // block_size
+            block_offset = offs_n % block_size
+            table_offsets = batch_idx * max_num_blocks + block_num
+            physical_blocks = tl.load(table_offsets + block_tables_ptr, mask=mask_n, other=-1)
+            valid = mask_n & (physical_blocks >= 0)
+            kv_offsets = (
+                physical_blocks[:, None] * block_size * num_kv_heads * head_dim
+                + block_offset[:, None] * num_kv_heads * head_dim
+                + kv_head_idx * head_dim
+                + offs_d[None, :]
+            )
+            k = tl.load(k_cache_ptr + kv_offsets, mask=valid[:, None], other=0.0)
+            qk = tl.sum(k * q[None, :], axis=1) * scale
+            qk = tl.where(valid, qk, -1e10)
             
             # Online softmax
             m_ij = tl.max(qk)
@@ -421,31 +444,9 @@ def paged_attention_decode_kernel(
             acc = acc * alpha
             l_i = l_i * alpha
             
-            # Load V and accumulate
-            for i in range(BLOCK_N):
-                token_idx = token_start + i
-                if token_idx < context_len:
-                    block_num = token_idx // block_size
-                    block_offset = token_idx % block_size
-                    
-                    if block_num < max_num_blocks:
-                        # Look up physical block
-                        block_table_offset = batch_idx * max_num_blocks + block_num
-                        physical_block_idx = tl.load(block_tables_ptr + block_table_offset)
-                        
-                        if physical_block_idx != -1:
-                            # Load V
-                            v_offset = (physical_block_idx * block_size * num_kv_heads * head_dim +
-                                       block_offset * num_kv_heads * head_dim +
-                                       kv_head_idx * head_dim + offs_d)
-                            v_vec = tl.load(v_cache_ptr + v_offset)
-                            
-                            # Extract weight for this token from p
-                            mask_i = tl.arange(0, BLOCK_N) == i
-                            weight = tl.sum(tl.where(mask_i, p, 0.0))
-                            
-                            acc = acc + weight * v_vec
-                            l_i = l_i + weight
+            v = tl.load(v_cache_ptr + kv_offsets, mask=valid[:, None], other=0.0)
+            acc += tl.sum(p[:, None].to(v.dtype) * v, axis=0)
+            l_i += tl.sum(p)
             
             m_i = m_i_new
     
@@ -561,8 +562,22 @@ class Attention(nn.Module):
             if cu_seqlens is None:
                 raise ValueError("cu_seqlens_q must be provided for varlen attention")
             
-            o = flash_attention_prefill(q, k, v, cu_seqlens, scale, 
-                                        self.num_heads, self.num_kv_heads, self.head_dim)
+            if context.block_tables is not None:
+                o = paged_attention_prefill(
+                    q,
+                    k_cache,
+                    v_cache,
+                    context.block_tables,
+                    context.seqlens_q,
+                    context.seqlens_k,
+                    scale,
+                    self.num_heads,
+                    self.num_kv_heads,
+                    self.block_size,
+                )
+            else:
+                o = flash_attention_prefill(q, k, v, cu_seqlens, scale,
+                                            self.num_heads, self.num_kv_heads, self.head_dim)
             # Output: (total_tokens, num_heads, head_dim) -> (total_tokens, num_heads * head_dim)
             return o.reshape(o.shape[0], self.num_heads * self.head_dim)
         # 计算量小：只需要计算新token与历史token的注意力

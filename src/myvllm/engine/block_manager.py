@@ -9,6 +9,7 @@ class Block:
         self.block_id = block_id
         self.hash = -1 
         self.ref_count = 0
+        self.pin_count = 0
         self.token_ids = []
 
 
@@ -19,6 +20,7 @@ class Block:
     def reset(self):
         self.hash = -1 
         self.ref_count = 0
+        self.pin_count = 0
         self.token_ids = []
 
 class BlockManager:
@@ -33,6 +35,8 @@ class BlockManager:
         self.free_block_ids: deque[int] = deque(range(num_blocks))
         # used block ids
         self.used_block_ids: set[int] = set()
+        self.cache_hits = 0
+        self.cache_misses = 0
 
     # given token_ids, compute the hash value
     # use prefix_hash_value to compute the hash in a context-sensitive way
@@ -52,6 +56,15 @@ class BlockManager:
         self.used_block_ids.add(block_id)
         return block
 
+    def _acquire_cached_block(self, block_id: int) -> Block:
+        """Acquire a cached block without clearing its hash or token metadata."""
+        block = self.blocks[block_id]
+        if block_id not in self.used_block_ids:
+            self.free_block_ids.remove(block_id)
+            self.used_block_ids.add(block_id)
+        block.ref_count += 1
+        return block
+
     def _deallocate_block(self, block_id: int) -> None:
         assert self.blocks[block_id].ref_count == 0, "Block is still in use"
         block = self.blocks[block_id]
@@ -61,10 +74,28 @@ class BlockManager:
 
     # whether we can allocate a block for this sequence
     def can_allocate(self, seq: Sequence) -> bool:
-        return len(self.free_block_ids) >= seq.num_blocks
+        seq.block_size = self.block_size
+        h = -1
+        misses = 0
+        for i in range(seq.num_blocks):
+            token_ids = seq.block(i)
+            h = (
+                self.compute_hash(token_ids, h)
+                if len(token_ids) == self.block_size
+                else -1
+            )
+            block_id = self.hash_to_block_id.get(h, -1)
+            if (
+                h == -1
+                or block_id == -1
+                or self.blocks[block_id].token_ids != token_ids
+            ):
+                misses += 1
+        return len(self.free_block_ids) >= misses
 
 
     def allocate(self, seq: Sequence) -> None:
+        seq.block_size = self.block_size
         h = -1
         for i in range(seq.num_blocks):
             no_cache_found = False
@@ -82,16 +113,14 @@ class BlockManager:
                 # update sequence information
                 seq.num_cached_tokens += self.block_size # which == len(token_ids)
                 # update block information, considering the edge case that the block is not allocated yet but with hash code
-                if block_id not in self.used_block_ids:
-                    block = self._allocate_block(block_id)
-                else:
-                    # update block information
-                    block = self.blocks[self.hash_to_block_id[h]]
-                    block.ref_count += 1
+                block = self._acquire_cached_block(block_id)
+                self.cache_hits += 1
             else:
                 # cache miss
                 block = self._allocate_block(self.free_block_ids[0])
                 block.update(h=h, token_ids=token_ids)
+                block.ref_count = 1
+                self.cache_misses += 1
                 if h != -1:
                     self.hash_to_block_id[h] = block.block_id
             seq.block_table.append(block.block_id)
@@ -106,6 +135,44 @@ class BlockManager:
         # update sequence information
         seq.block_table = []
         seq.num_cached_tokens = 0
+
+    def pin_prefix(self, token_ids: list[int]) -> int:
+        """Keep every cached full block in ``token_ids`` resident.
+
+        Returns the number of newly pinned tokens. The prefix must have been
+        evaluated once so its KV blocks already exist in the cache.
+        """
+        h = -1
+        pinned_tokens = 0
+        for start in range(0, len(token_ids) - self.block_size + 1, self.block_size):
+            block_tokens = token_ids[start : start + self.block_size]
+            h = self.compute_hash(block_tokens, h)
+            block_id = self.hash_to_block_id.get(h, -1)
+            if block_id == -1 or self.blocks[block_id].token_ids != block_tokens:
+                break
+            block = self.blocks[block_id]
+            if block.pin_count == 0:
+                self._acquire_cached_block(block_id)
+            block.pin_count += 1
+            pinned_tokens += self.block_size
+        return pinned_tokens
+
+    def unpin_all(self) -> None:
+        for block in self.blocks:
+            if block.pin_count == 0:
+                continue
+            block.ref_count -= 1
+            block.pin_count = 0
+            if block.ref_count == 0:
+                self._deallocate_block(block.block_id)
+
+    def cache_stats(self) -> dict[str, int]:
+        return {
+            "hits": self.cache_hits,
+            "misses": self.cache_misses,
+            "pinned_blocks": sum(block.pin_count > 0 for block in self.blocks),
+            "free_blocks": len(self.free_block_ids),
+        }
 
     # this is to check whether we can append tokens to this sequence
     # when that token would require allocating a new block.
@@ -132,29 +199,34 @@ class BlockManager:
             # Previous block should be finalized
             assert self.blocks[last_block_for_seq_id].hash != -1
             block = self._allocate_block(self.free_block_ids[0])
+            block.ref_count = 1
             block_tables.append(block.block_id)
         # else, do nothing
         else:
             assert last_block_for_seq_id in self.used_block_ids, "Last block should be allocated"
             assert self.blocks[last_block_for_seq_id].hash == -1, "Last block should be partial block with hash -1"
+    def rollback(self, seq: Sequence, num_tokens: int) -> None:
+        """Roll back speculative tokens and release no-longer-needed blocks."""
+        if num_tokens <= 0:
+            return
+        if num_tokens > seq.num_completion_tokens:
+            raise ValueError("rollback cannot remove prompt tokens")
 
+        old_num_blocks = len(seq.block_table)
+        seq.token_ids = seq.token_ids[:-num_tokens]
+        seq.num_tokens -= num_tokens
+        seq.last_token = seq.token_ids[-1]
 
-
-def rollback(self, seq: Sequence, num_tokens: int) -> None:
-    """回滚序列的最后num_tokens个令牌"""
-    if num_tokens <= 0:
-        return
-        
-    # 移除令牌
-    seq.token_ids = seq.token_ids[:-num_tokens]
-    seq.num_tokens -= num_tokens
-    
-    # 计算需要释放的块
-    old_num_blocks = len(seq.block_table)
-    new_num_blocks = seq.num_blocks
-    
-    # 释放多余的块
-    if new_num_blocks < old_num_blocks:
-        for i in range(new_num_blocks, old_num_blocks):
+        while len(seq.block_table) > seq.num_blocks:
             block_id = seq.block_table.pop()
-            self._deallocate_block(block_id)
+            block = self.blocks[block_id]
+            block.ref_count -= 1
+            if block.ref_count == 0:
+                self._deallocate_block(block_id)
+
+        if seq.block_table and seq.num_tokens % self.block_size:
+            block = self.blocks[seq.block_table[-1]]
+            if block.hash != -1 and self.hash_to_block_id.get(block.hash) == block.block_id:
+                del self.hash_to_block_id[block.hash]
+            block.hash = -1
+            block.token_ids = []

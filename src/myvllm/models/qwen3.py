@@ -207,12 +207,10 @@ class Qwen3DecoderLayer(nn.Module):
         from myvllm.utils import get_context
         context = get_context()
         if context.is_prefill and context.cu_seqlens_q is not None:
-            # For batched prefill, create positions that restart at 0 for each sequence
             positions = []
-            cu_seqlens = context.cu_seqlens_q.cpu().tolist()
-            for i in range(len(cu_seqlens) - 1):
-                seq_len = cu_seqlens[i+1] - cu_seqlens[i]
-                positions.extend(range(seq_len))
+            for q_len, k_len in zip(context.seqlens_q, context.seqlens_k):
+                cached_tokens = k_len - q_len
+                positions.extend(range(cached_tokens, k_len))
             positions = torch.tensor(positions, dtype=torch.long, device=x.device)
         elif context.is_prefill:
             # For single sequence prefill, use sequential positions
