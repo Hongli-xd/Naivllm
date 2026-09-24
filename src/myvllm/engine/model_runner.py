@@ -373,10 +373,6 @@ class ModelRunner:
             # For varlen prefill, keep input_ids as 1D (concatenated tokens)
             # Do NOT unsqueeze - flash_attn_varlen_func expects 1D input with cu_seqlens
             hidden_states = self.model(input_ids)
-            if is_prefill:
-                context = get_context()
-                last_token_indices = context.cu_seqlens_q[1:].long() - 1
-                hidden_states = hidden_states[last_token_indices]
             logits = self.model.compute_logits(hidden_states)
         else:
             bs = input_ids.size(0)
