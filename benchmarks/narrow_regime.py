@@ -197,6 +197,18 @@ def benchmark_prefix(backend: Any, args: argparse.Namespace) -> dict[str, Any]:
     suffix_a = make_prompts(backend.vocab_size, 1, args.prefix_suffix_tokens, 9001)[0]
     suffix_b = make_prompts(backend.vocab_size, 1, args.prefix_suffix_tokens, 9002)[0]
 
+    # Compile/warm the cached-prefix path with a disjoint prefix so its one-time
+    # cost is not attributed to the measured warm request.
+    calibration = make_prompts(backend.vocab_size, 1, prefix_len, 8000)[0]
+    calibration_suffix_a = make_prompts(
+        backend.vocab_size, 1, args.prefix_suffix_tokens, 8001
+    )[0]
+    calibration_suffix_b = make_prompts(
+        backend.vocab_size, 1, args.prefix_suffix_tokens, 8002
+    )[0]
+    backend.generate([calibration + calibration_suffix_a], 1)
+    backend.generate([calibration + calibration_suffix_b], 1)
+
     cold = backend.generate([prefix + suffix_a], 1)
     warm = backend.generate([prefix + suffix_b], 1)
     pinned_tokens = backend.pin_prefix(prefix)

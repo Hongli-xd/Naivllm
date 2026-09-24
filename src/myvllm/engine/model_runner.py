@@ -466,13 +466,13 @@ class ModelRunner:
             if self.rank == 0:
                 outputs[:batch_size] = self.sampler(logits, temperatures[:batch_size])
 
-            with torch.cuda.graph(graph, graph_pool):
+            with torch.cuda.graph(graph, pool=graph_pool):
                 hidden_states = self.model(input_ids[:batch_size])
                 logits = self.model.compute_logits(hidden_states)
                 if self.rank == 0:
                     outputs[:batch_size] = self.sampler(logits, temperatures[:batch_size])
-                if graph_pool is None:
-                    graph_pool = graph.pool()
+            if graph_pool is None:
+                graph_pool = graph.pool()
             # store the captured graph
             self.graphs[batch_size] = graph
 
