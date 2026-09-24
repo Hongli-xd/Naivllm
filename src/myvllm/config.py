@@ -32,8 +32,12 @@ def build_engine_config(
 
     num_heads = hf_config.num_attention_heads
     head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // num_heads)
-    dtype = getattr(hf_config, "torch_dtype", None)
+    dtype = getattr(hf_config, "dtype", None)
     dtype_name = str(dtype).removeprefix("torch.") if dtype is not None else "bfloat16"
+    rope_parameters = getattr(hf_config, "rope_parameters", None) or {}
+    rope_theta = getattr(hf_config, "rope_theta", None) or rope_parameters.get(
+        "rope_theta", 10000
+    )
 
     config: dict[str, Any] = {
         "model_name_or_path": model_name_or_path,
@@ -53,7 +57,7 @@ def build_engine_config(
         "intermediate_size": hf_config.intermediate_size,
         "num_layers": hf_config.num_hidden_layers,
         "tie_word_embeddings": hf_config.tie_word_embeddings,
-        "base": hf_config.rope_theta,
+        "base": rope_theta,
         "rms_norm_epsilon": hf_config.rms_norm_eps,
         "qkv_bias": getattr(hf_config, "attention_bias", False),
         "ffn_bias": getattr(hf_config, "mlp_bias", False),
