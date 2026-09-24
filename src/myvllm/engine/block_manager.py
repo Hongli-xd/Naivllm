@@ -67,8 +67,6 @@ class BlockManager:
 
     def _deallocate_block(self, block_id: int) -> None:
         assert self.blocks[block_id].ref_count == 0, "Block is still in use"
-        block = self.blocks[block_id]
-        block.token_ids = []
         self.used_block_ids.remove(block_id)
         self.free_block_ids.append(block_id)
 
