@@ -13,6 +13,38 @@ def default_weight_loader(param, weight):
     param.data.copy_(weight)
 
 
+def _load_into_param(param, tensors, ids):
+    """Load ``tensors`` into ``param``, honoring its TP-aware ``weight_loader``.
+
+    ``ids`` carries the per-tensor identifier expected by merged projections
+    ('q'/'k'/'v' for QKV, 0/1 for gate_up); None for plain parameters.
+    """
+    loader = getattr(param, "weight_loader", None)
+    if callable(loader):
+        for tensor, tensor_id in zip(tensors, ids):
+            if tensor_id is None:
+                loader(param, tensor)
+            else:
+                loader(param, tensor, tensor_id)
+        return
+    if len(tensors) == 1:
+        if param.shape != tensors[0].shape:
+            # vocab-size mismatch fallback (trimmed checkpoints)
+            min_size = min(param.shape[0], tensors[0].shape[0])
+            param.data[:min_size].copy_(tensors[0][:min_size])
+        else:
+            param.data.copy_(tensors[0])
+    else:
+        param.data.copy_(torch.cat(tensors, dim=0))
+
+
+def k_or_v_present(hf_weights: dict, q_name: str, suffix: str) -> bool:
+    """Whether the k/v counterparts of a q_proj tensor exist in the checkpoint."""
+    k_name = q_name.replace('q_proj', 'k_proj')
+    v_name = q_name.replace('q_proj', 'v_proj')
+    return k_name in hf_weights and v_name in hf_weights
+
+
 def load_weights_from_checkpoint(model: nn.Module, model_name_or_path: str):
     """
     Load weights from a Hugging Face model checkpoint into the custom model.
@@ -74,101 +106,87 @@ def load_weights_from_checkpoint(model: nn.Module, model_name_or_path: str):
     # Process each HF weight
     for hf_name, hf_weight in hf_weights.items():
         try:
-            # 1. Handle QKV merge (q_proj + k_proj + v_proj → qkv_projection)
-            if '.self_attn.q_proj.weight' in hf_name:
-                # hf_name = "model.layers.15.self_attn.q_proj.weight"
-                layer_match = re.search(r'layers\.(\d+)', hf_name)
-                if layer_match:
-                    layer_idx = layer_match.group(1)
-                    k_name = hf_name.replace('q_proj', 'k_proj')
-                    v_name = hf_name.replace('q_proj', 'v_proj')
+            layer_match = re.search(r'layers\.(\d+)', hf_name)
+            layer_idx = layer_match.group(1) if layer_match else None
 
-                    if k_name in hf_weights and v_name in hf_weights:
-                        q_weight = hf_weight
-                        k_weight = hf_weights[k_name]
-                        v_weight = hf_weights[v_name]
+            # 1. Handle QKV merge (q_proj + k_proj + v_proj → qkv_projection),
+            #    for both weight and bias (Qwen3 checkpoints with
+            #    attention_bias=True carry q/k/v biases)
+            if (
+                layer_idx is not None
+                and '.self_attn.q_proj.weight' in hf_name
+                and k_or_v_present(hf_weights, hf_name, '.weight')
+            ):
+                k_name = hf_name.replace('q_proj', 'k_proj')
+                v_name = hf_name.replace('q_proj', 'v_proj')
+                custom_name = f"model.layers.{layer_idx}.self_attn.qkv_projection.weight"
+                try:
+                    param = model.get_parameter(custom_name)
+                    _load_into_param(param,
+                                     [hf_weight, hf_weights[k_name], hf_weights[v_name]],
+                                     ['q', 'k', 'v'])
+                    loaded_params.update({custom_name, hf_name, k_name, v_name})
+                except AttributeError:
+                    skipped_params.append((custom_name, "Parameter not found"))
 
-                        # Concatenate q, k, v along output dimension
-                        qkv_weight = torch.cat([q_weight, k_weight, v_weight], dim=0)
-
-                        custom_name = f"model.layers.{layer_idx}.self_attn.qkv_projection.weight"
-                        try:
-                            # 同时标记原始权重已处理
-                            param = model.get_parameter(custom_name)
-                            param.data.copy_(qkv_weight)
-                            loaded_params.add(custom_name)
-                            loaded_params.add(hf_name)
-                            loaded_params.add(k_name)
-                            loaded_params.add(v_name)
-                        except AttributeError:
-                            skipped_params.append((custom_name, "Parameter not found"))
+            elif (
+                layer_idx is not None
+                and '.self_attn.q_proj.bias' in hf_name
+                and k_or_v_present(hf_weights, hf_name, '.bias')
+            ):
+                k_name = hf_name.replace('q_proj', 'k_proj')
+                v_name = hf_name.replace('q_proj', 'v_proj')
+                custom_name = f"model.layers.{layer_idx}.self_attn.qkv_projection.bias"
+                try:
+                    param = model.get_parameter(custom_name)
+                    _load_into_param(param,
+                                     [hf_weight, hf_weights[k_name], hf_weights[v_name]],
+                                     ['q', 'k', 'v'])
+                    loaded_params.update({custom_name, hf_name, k_name, v_name})
+                except AttributeError:
+                    skipped_params.append((custom_name, "Parameter not found"))
 
             # 2. Handle gate_up merge (gate_proj + up_proj → gate_up)
-            elif '.mlp.gate_proj.weight' in hf_name:
-                layer_match = re.search(r'layers\.(\d+)', hf_name)
-                if layer_match:
-                    layer_idx = layer_match.group(1)
-                    up_name = hf_name.replace('gate_proj', 'up_proj')
-
-                    if up_name in hf_weights:
-                        gate_weight = hf_weight
-                        up_weight = hf_weights[up_name]
-
-                        # Concatenate gate and up along output dimension
-                        gate_up_weight = torch.cat([gate_weight, up_weight], dim=0)
-
-                        custom_name = f"model.layers.{layer_idx}.mlp.gate_up.weight"
-                        try:
-                            param = model.get_parameter(custom_name)
-                            param.data.copy_(gate_up_weight)
-                            loaded_params.add(custom_name)
-                            loaded_params.add(hf_name)
-                            loaded_params.add(up_name)
-                        except AttributeError:
-                            skipped_params.append((custom_name, "Parameter not found"))
+            elif (
+                layer_idx is not None
+                and '.mlp.gate_proj.weight' in hf_name
+                and hf_name.replace('gate_proj', 'up_proj') in hf_weights
+            ):
+                up_name = hf_name.replace('gate_proj', 'up_proj')
+                custom_name = f"model.layers.{layer_idx}.mlp.gate_up.weight"
+                try:
+                    param = model.get_parameter(custom_name)
+                    _load_into_param(param, [hf_weight, hf_weights[up_name]], [0, 1])
+                    loaded_params.update({custom_name, hf_name, up_name})
+                except AttributeError:
+                    skipped_params.append((custom_name, "Parameter not found"))
 
             # 3. Handle gate_up merge for bias (if present)
-            elif '.mlp.gate_proj.bias' in hf_name:
-                layer_match = re.search(r'layers\.(\d+)', hf_name)
-                if layer_match:
-                    layer_idx = layer_match.group(1)
-                    up_bias_name = hf_name.replace('gate_proj', 'up_proj')
-
-                    if up_bias_name in hf_weights:
-                        gate_bias = hf_weight
-                        up_bias = hf_weights[up_bias_name]
-                        gate_up_bias = torch.cat([gate_bias, up_bias], dim=0)
-
-                        custom_name = f"model.layers.{layer_idx}.mlp.gate_up.bias"
-                        try:
-                            param = model.get_parameter(custom_name)
-                            param.data.copy_(gate_up_bias)
-                            loaded_params.add(custom_name)
-                            loaded_params.add(hf_name)
-                            loaded_params.add(up_bias_name)
-                        except AttributeError:
-                            skipped_params.append((custom_name, "Parameter not found"))
+            elif (
+                layer_idx is not None
+                and '.mlp.gate_proj.bias' in hf_name
+                and hf_name.replace('gate_proj', 'up_proj') in hf_weights
+            ):
+                up_bias_name = hf_name.replace('gate_proj', 'up_proj')
+                custom_name = f"model.layers.{layer_idx}.mlp.gate_up.bias"
+                try:
+                    param = model.get_parameter(custom_name)
+                    _load_into_param(param, [hf_weight, hf_weights[up_bias_name]], [0, 1])
+                    loaded_params.update({custom_name, hf_name, up_bias_name})
+                except AttributeError:
+                    skipped_params.append((custom_name, "Parameter not found"))
 
             # 4. Skip k_proj, v_proj, up_proj (already merged)
             elif any(x in hf_name for x in ['.k_proj.', '.v_proj.', '.up_proj.']):
                 if hf_name not in loaded_params:
                     skipped_params.append((hf_name, "Merged into qkv_projection or gate_up"))
 
-            # 5. All other parameters: load directly (names match HF)
+            # 5. All other parameters: load through the parameter's own
+            #    (possibly TP-sharding) weight_loader
             else:
                 try:
                     param = model.get_parameter(hf_name)
-                    if param.shape != hf_weight.shape:
-                        # Handle vocab size mismatch for embeddings/lm_head
-                        if len(param.shape) > 0 and len(hf_weight.shape) > 0:
-                            min_size = min(param.shape[0], hf_weight.shape[0])
-                            param.data[:min_size].copy_(hf_weight[:min_size])
-                        else:
-                            # PyTorch自动处理CPU→GPU传输
-                            param.data.copy_(hf_weight)
-                    else:
-                        # 处理标量参数（如layer norm的epsilon）
-                        param.data.copy_(hf_weight)
+                    _load_into_param(param, [hf_weight], [None])
                     loaded_params.add(hf_name)
                 except AttributeError:
                     skipped_params.append((hf_name, "Parameter not found"))

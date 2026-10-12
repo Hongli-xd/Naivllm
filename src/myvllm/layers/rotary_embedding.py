@@ -71,7 +71,8 @@ class RotaryEmbedding(nn.Module):
         cos_sin_cache = torch.cat([cos, sin], dim=-1)
         self.register_buffer("cos_sin_cache", cos_sin_cache)
 
-    @torch.compile
+    # NOTE: torch.compile removed - compiled regions execute host-side
+    # guards that are incompatible with manual CUDA-graph capture on torch>=2.9
     # tell the position index of the token
     # apply rotary embedding to query and key
     def forward(self, positions, query, key):

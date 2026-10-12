@@ -46,9 +46,10 @@ class Qwen3Attention(nn.Module):
         self.kv_size = head_dim * self.num_kv_heads
         self.qkv_bias = qkv_bias
 
-        # Q and K norms as used in Qwen3
-        self.q_norm = LayerNorm(torch.ones(head_dim))
-        self.k_norm = LayerNorm(torch.ones(head_dim))
+        # Q and K norms as used in Qwen3 (applied unconditionally; the
+        # architecture defines them regardless of attention bias)
+        self.q_norm = LayerNorm(torch.ones(head_dim), eps=rms_norm_epsilon)
+        self.k_norm = LayerNorm(torch.ones(head_dim), eps=rms_norm_epsilon)
 
         self.rotary_emb = RotaryEmbedding(
             base=base,
@@ -106,14 +107,10 @@ class Qwen3Attention(nn.Module):
         # Apply Q and K norms - these are used in Qwen3 to stabilize attention
         # Applied to q and k because they participate in attention_weight computation
         # Removes possibility of large numbers that cause softmax instability
-        if self.qkv_bias is False:
-            q = self.q_norm(q)
-            k = self.k_norm(k)
+        q = self.q_norm(q)
+        k = self.k_norm(k)
 
-        # DEBUG: Print positions to diagnose issue
-        import sys
-
-        q, k = self.rotary_emb(positions, q, k) 
+        q, k = self.rotary_emb(positions, q, k)
 
         o = self.attention(q, k, v)
         # o shape: (B*N, num_heads, head_dim)     - Per-GPU, different heads per GPU
@@ -177,7 +174,7 @@ class Qwen3DecoderLayer(nn.Module):
     ):
         super().__init__()
         gamma = torch.ones(hidden_size)
-        self.input_layernorm = LayerNorm(gamma)
+        self.input_layernorm = LayerNorm(gamma, eps=rms_norm_epsilon)
         self.self_attn = Qwen3Attention(
             hidden_size=hidden_size,
             num_heads=num_heads,
@@ -190,7 +187,7 @@ class Qwen3DecoderLayer(nn.Module):
             max_position=max_position,
             block_size=block_size,
         )
-        self.post_attention_layernorm = LayerNorm(gamma)
+        self.post_attention_layernorm = LayerNorm(gamma, eps=rms_norm_epsilon)
         self.mlp = Qwen3MLP(
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
@@ -206,7 +203,11 @@ class Qwen3DecoderLayer(nn.Module):
         # Compute positions based on context (respecting sequence boundaries for batched prefill)
         from myvllm.utils import get_context
         context = get_context()
-        if context.is_prefill and context.cu_seqlens_q is not None:
+        if context.is_verify and context.positions is not None:
+            # graph-replayable: positions is a persistent tensor owned by the
+            # caller (and avoids rebuilding it in Python 28 times per forward)
+            positions = context.positions
+        elif (context.is_prefill or context.is_verify) and context.cu_seqlens_q is not None:
             positions = []
             for q_len, k_len in zip(context.seqlens_q, context.seqlens_k):
                 cached_tokens = k_len - q_len
@@ -269,7 +270,7 @@ class Qwen3Model(nn.Module):
             ) for _ in range(num_layers)
         ])
         gamma = torch.ones(hidden_size)
-        self.norm = LayerNorm(gamma)
+        self.norm = LayerNorm(gamma, eps=rms_norm_epsilon)
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
         x = self.embed_tokens(input_ids)

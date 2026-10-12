@@ -70,11 +70,13 @@ class ParallelLMHead(VocabParallelEmbedding):
     # weight: [vocab_size_per_partition, hidden_size]
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         context = get_context()
-        if context.is_prefill:
+        if context.is_prefill and not context.is_verify:
             # cu_seqlens_q = [0, 5, 8, 12]
             # last_indices = [5, 8, 12] - 1 = [4, 7, 11]
             last_token = context.cu_seqlens_q[1:] - 1  # exclude the first element which is 0
             x = x[last_token].contiguous()
+        # speculative verification needs the logits of EVERY drafted position;
+        # the caller slices the rows it accepted
 
         # logits: [batch_size, seq_len, vocab_size_per_partition]
         # F.linear automatically transpose the weight

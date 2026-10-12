@@ -13,7 +13,8 @@ class LayerNorm(torch.nn.Module):
         """Backward compatibility: gamma alias for weight"""
         return self.weight
 
-    @torch.compile
+    # NOTE: torch.compile removed - compiled regions execute host-side
+    # guards that are incompatible with manual CUDA-graph capture on torch>=2.9
     def rms_forward(self, x: torch.Tensor) -> torch.Tensor:
         # RMSNorm(x) = (x / sqrt(mean(x²) + ε)) ⊙ γ
 

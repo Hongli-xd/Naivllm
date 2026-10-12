@@ -33,9 +33,37 @@ class ModelRunner:
         self.block_size = config['block_size']
         self.world_size = config['world_size']
         self.enforce_eager = config.get('enforce_eager', False)
+        # sequence attributes this runner's cache is mapped through; a
+        # speculative-decoding draft model tracks its own block table so
+        # draft and target caches stay independent
+        self.table_attr = config.get('seq_table_attr', 'block_table')
+        self.cached_attr = config.get('seq_cached_attr', 'num_cached_tokens')
+        # draft runners can capture their sampled-token graph output AND the
+        # pre-sampling logits (needed for stochastic rejection sampling)
+        self.capture_logits = config.get('capture_logits', False)
 
         self.rank = rank
-        dist.init_process_group('nccl', "tcp://localhost:12345", world_size=config['world_size'], rank=rank)
+        # A process may host several runners (e.g. draft + target models for
+        # speculative decoding); init the process group only once, and only
+        # when it is actually needed for multi-GPU execution.
+        if self.world_size > 1 and not dist.is_initialized():
+            dist.init_process_group(
+                'nccl',
+                init_method=f"tcp://localhost:{config.get('dist_port', 12345)}",
+                world_size=self.world_size,
+                rank=rank,
+            )
+        elif not dist.is_initialized():
+            # single-process, single-GPU: a trivial per-process group so layer
+            # helpers (dist.get_rank/get_world_size) keep working; a file
+            # store avoids port clashes between independent engines
+            import os, tempfile
+            store_file = os.path.join(
+                tempfile.gettempdir(), f"myvllm_dist_{os.getpid()}.store"
+            )
+            dist.init_process_group(
+                'gloo', store=dist.FileStore(store_file, 1), world_size=1, rank=0
+            )
         torch.cuda.set_device(rank)
 
         dtype_name = config.get("dtype", "bfloat16")
@@ -99,6 +127,13 @@ class ModelRunner:
         # capture cuda graph for decoding
         if not self.enforce_eager:
             self.capture_cudagraph()
+            # speculative-decoding verification forwards are decode-bound
+            # too; graph them so a round costs one replay instead of ~28
+            # layers of eager Python dispatch
+            if self.config.get('capture_verify'):
+                import os
+                if not os.environ.get('NAIVLLM_NO_VERIFY_GRAPH'):
+                    self.capture_verify_graphs()
 
         torch.set_default_dtype(original_dtype)
 
@@ -266,26 +301,28 @@ class ModelRunner:
         block_tables = []
         for seq in seqs:
             token_ids = seq.token_ids
-            num_cached_tokens = seq.num_cached_tokens
+            num_cached_tokens = getattr(seq, self.cached_attr)
             input_ids.extend(token_ids[num_cached_tokens:])
             # K和V总是成对出现，使用相同的缓存结构，不需要分别处理。slot_mapping同时适用于K和V；block_tables同时管理K和V的块
             seqlens_q.append(len(token_ids) - num_cached_tokens)
             seqlens_k.append(len(token_ids))
             cu_seqlens_q.append(cu_seqlens_q[-1] + seqlens_q[-1])
             cu_seqlens_k.append(cu_seqlens_k[-1] + seqlens_k[-1])
-            if seq.block_table:
-                for i, block_id in enumerate(seq.block_table[seq.num_cached_blocks:]):
-                    if seq.num_cached_blocks + i != seq.num_blocks - 1:
+            if getattr(seq, self.table_attr):
+                table = getattr(seq, self.table_attr)
+                num_cached_blocks = getattr(seq, self.cached_attr) // self.block_size
+                for i, block_id in enumerate(table[num_cached_blocks:]):
+                    if num_cached_blocks + i != seq.num_blocks - 1:
                         slot_mappings.extend(list(range(block_id * self.block_size, (block_id+1) * self.block_size)))
                     else:
                         slot_mappings.extend(list(range(block_id * self.block_size, block_id * self.block_size + seq.last_block_num_tokens)))
         # 张量的形状必须一致
         if cu_seqlens_q[-1] < cu_seqlens_k[-1]:
             # pad block_tables
-            all_block_tables = [seq.block_table for seq in seqs]
+            all_block_tables = [getattr(seq, self.table_attr) for seq in seqs]
             max_num_blocks = max(len(bt) for bt in all_block_tables)
             for i, seq in enumerate(seqs):
-                block_table = seq.block_table + [-1]*(max_num_blocks - len(seq.block_table))
+                block_table = getattr(seq, self.table_attr) + [-1]*(max_num_blocks - len(getattr(seq, self.table_attr)))
                 # 加到全局block_tables列表中
                 block_tables.append(block_table)
         # 使用锁页内存，加速 CPU 到 GPU 传输
@@ -329,17 +366,19 @@ class ModelRunner:
     # prepare input data for decoding
     def prepare_decode(self, seqs: list[Sequence]) -> torch.Tensor:
         input_ids = []
-        context_lens = []   
-        slot_mappings = []  
+        context_lens = []
+        slot_mappings = []
         block_tables = []
         for seq in seqs:
+            table = getattr(seq, self.table_attr)
             input_ids.append(seq.last_token)
             context_lens.append(len(seq))
-            slot_mappings.append(seq.block_table[-1] * self.block_size + seq.last_block_num_tokens - 1)
-        all_block_tables = [seq.block_table for seq in seqs]
+            slot_mappings.append(table[-1] * self.block_size + seq.last_block_num_tokens - 1)
+        all_block_tables = [getattr(seq, self.table_attr) for seq in seqs]
         max_num_blocks = max(len(bt) for bt in all_block_tables)
         for i, seq in enumerate(seqs):
-            block_table = seq.block_table + [-1]*(max_num_blocks - len(seq.block_table))
+            table = getattr(seq, self.table_attr)
+            block_table = table + [-1]*(max_num_blocks - len(table))
             block_tables.append(block_table)
         input_ids = torch.tensor(input_ids, dtype=torch.long, pin_memory=True).cuda(non_blocking=True)
         set_context(
@@ -357,6 +396,55 @@ class ModelRunner:
     # prepare the temperature
     def prepare_sample(self, seqs: list[Sequence]) -> None:
         return torch.tensor([seq.temperature for seq in seqs], dtype=torch.float32, pin_memory=True).cuda(non_blocking=True)
+
+    # prepare inputs for a speculative-decoding verification forward.
+    # every sequence carries K_i draft tokens appended to token_ids; the
+    # forward consumes [last_confirmed, d_1..d_{K_i}] and returns the logits
+    # of all K_i+1 rows so the caller can accept/reject each drafted token.
+    def prepare_spec_verify(self, seqs: list[Sequence]) -> torch.Tensor:
+        input_ids = []
+        slot_mappings = []
+        positions = []
+        seqlens_q = []
+        seqlens_k = []
+        cu_seqlens_q = [0]
+        block_tables = []
+        for seq in seqs:
+            table = getattr(seq, self.table_attr)
+            q_len = len(seq.draft_tokens) + 1
+            k_len = len(seq)
+            # inputs: positions n-1 .. n+K-1 where n = k_len - num_drafts
+            for pos in range(k_len - q_len, k_len):
+                input_ids.append(seq.token_ids[pos])
+                positions.append(pos)
+                block_idx = pos // self.block_size
+                slot_mappings.append(table[block_idx] * self.block_size + pos % self.block_size)
+            seqlens_q.append(q_len)
+            seqlens_k.append(k_len)
+            cu_seqlens_q.append(cu_seqlens_q[-1] + q_len)
+        max_num_blocks = max(len(getattr(seq, self.table_attr)) for seq in seqs)
+        for seq in seqs:
+            table = getattr(seq, self.table_attr)
+            block_tables.append(table + [-1] * (max_num_blocks - len(table)))
+
+        set_context(
+            is_prefill=True,   # multi-token forward semantics
+            is_verify=True,
+            cu_seqlens_q=torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True),
+            cu_seqlens_k=None,
+            max_seqlen_q=max(seqlens_q),
+            max_seqlen_k=max(seqlens_k),
+            slot_mapping=torch.tensor(slot_mappings, dtype=torch.long, pin_memory=True).cuda(non_blocking=True),
+            context_lens=torch.tensor(seqlens_k, dtype=torch.long, pin_memory=True).cuda(non_blocking=True),
+            block_tables=torch.tensor(block_tables, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True),
+            seqlens_q=seqlens_q,
+            seqlens_k=seqlens_k,
+            positions=torch.tensor(positions, dtype=torch.long, pin_memory=True).cuda(non_blocking=True),
+        )
+        return torch.tensor(input_ids, dtype=torch.long, pin_memory=True).cuda(non_blocking=True)
+
+    # verification forward: returns logits (sum(K_i + 1), vocab) in batch order
+    # (impl next to the verify-graph capture at the end of this class)
 
     # when prefilling, directly compute model forward + logits
     # when decoding, use cuda graph execution to speed up
@@ -378,12 +466,16 @@ class ModelRunner:
             bs = input_ids.size(0)
             context = get_context()
 
-            # finds smallest captured graph that fits the batch size
-            graph = self.graphs[next(bs_ for bs_ in self.graphs.keys() if bs_ >= bs)]
+            # finds smallest captured graph that fits the batch size; keys are
+            # captured largest-first, so an unsorted scan would replay an
+            # oversized graph whose stale tail rows write garbage KV into
+            # slot 0 and corrupt live sequences
+            graph = self.graphs[min(bs_ for bs_ in self.graphs.keys() if bs_ >= bs)]
             vars = self.graph_vars
-            # copy input data into graph variables
+            # copy input data into graph variables; anything beyond bs must
+            # stay inert (slot -1 skips the KV store for padded rows)
             vars['input_ids'][:bs].copy_(input_ids)
-            vars['slot_mapping'][:bs].fill_(-1)
+            vars['slot_mapping'].fill_(-1)
             vars['slot_mapping'][:bs].copy_(context.slot_mapping)
             vars["context_lens"].zero_()
             vars['context_lens'][:bs].copy_(context.context_lens)
@@ -392,6 +484,8 @@ class ModelRunner:
             vars["temperatures"][:bs].copy_(temperatures)
             # replay the graph
             graph.replay()
+            if self.capture_logits:
+                return vars['outputs'][:bs], vars['logits_out'][:bs]
             logits = vars['outputs'][:bs]
 
         return logits
@@ -402,20 +496,26 @@ class ModelRunner:
     # run model
     # sample logits
     # reset context
-    def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
+    def run(self, seqs: list[Sequence], is_prefill: bool):
         if is_prefill:
             input_ids = self.prepare_prefill(seqs)
         else:
             input_ids = self.prepare_decode(seqs)
         temperatures = self.prepare_sample(seqs)
         logits_or_tokens = self.run_model(input_ids, is_prefill, temperatures)
-        # only sample when rank == 0
+        # only sample when rank == 0; tokens must come back as plain CPU ints
+        # so scheduler bookkeeping never touches CUDA tensors
         token_ids = None
         if self.rank == 0:
+            if isinstance(logits_or_tokens, tuple):
+                # (sampled_tokens, captured_logits) from a draft-model graph
+                sampled, logits = logits_or_tokens
+                reset_context()
+                return sampled.tolist(), logits
             if is_prefill or self.enforce_eager:
-                token_ids = self.sampler(logits_or_tokens, temperatures)
+                token_ids = self.sampler(logits_or_tokens, temperatures).tolist()
             else:
-                token_ids = logits_or_tokens
+                token_ids = logits_or_tokens.tolist()
         reset_context()
         return token_ids
 
@@ -441,6 +541,12 @@ class ModelRunner:
         block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32, device=f'cuda:{self.rank}')
         temperatures = torch.ones(max_bs, dtype=torch.float32, device=f'cuda:{self.rank}')
         outputs = torch.zeros(max_bs, dtype=torch.long, device=f'cuda:{self.rank}')
+        # optional: also capture pre-sampling logits (draft models need their
+        # distribution for stochastic rejection sampling)
+        logits_out = (
+            torch.zeros(max_bs, self.config['vocab_size'], dtype=self.default_dtype, device=f'cuda:{self.rank}')
+            if self.capture_logits else None
+        )
 
         # graphs to be captured for different batch sizes
         batch_sizes = sorted(
@@ -471,6 +577,8 @@ class ModelRunner:
                 logits = self.model.compute_logits(hidden_states)
                 if self.rank == 0:
                     outputs[:batch_size] = self.sampler(logits, temperatures[:batch_size])
+                    if logits_out is not None:
+                        logits_out[:batch_size] = logits
             if graph_pool is None:
                 graph_pool = graph.pool()
             # store the captured graph
@@ -487,4 +595,140 @@ class ModelRunner:
             block_tables=block_tables,
             temperatures=temperatures,
             outputs=outputs,
+            logits_out=logits_out,
         )
+
+    # capture verification graphs for speculative decoding: one graph per
+    # batch bucket, verifying a fixed number of drafted tokens K per sequence
+    # (all rows padded to K+1; pad rows carry position/slot -1 so they are
+    # inert). The captured logits land in verify_vars['logits'].
+    @torch.inference_mode()
+    def capture_verify_graphs(self) -> None:
+        max_bs = self.config['max_num_sequences']
+        max_len = self.config['max_model_length']
+        max_num_blocks = math.ceil(max_len / self.block_size)
+        k = self.config['num_spec_tokens']
+        rows = max_bs * (k + 1)
+
+        v_input_ids = torch.zeros(rows, dtype=torch.long, device=f'cuda:{self.rank}')
+        v_slot_mapping = torch.full((rows,), -1, dtype=torch.long, device=f'cuda:{self.rank}')
+        v_context_lens = torch.zeros(max_bs, dtype=torch.long, device=f'cuda:{self.rank}')
+        v_block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32, device=f'cuda:{self.rank}')
+        # absolute position per row; -1 marks an inert pad row
+        v_positions = torch.full((rows,), -1, dtype=torch.long, device=f'cuda:{self.rank}')
+        v_logits = torch.zeros(rows, self.config['vocab_size'], dtype=self.default_dtype, device=f'cuda:{self.rank}')
+        # debug tap: capture the final hidden states too
+        v_hidden_tap = torch.zeros(rows, self.config['hidden_size'], dtype=self.default_dtype, device=f'cuda:{self.rank}')
+
+        self.verify_graphs = {}
+        # kernel-argument tensors created per graph (e.g. cu_seqlens) must
+        # outlive the capture: the graph records their raw device pointers,
+        # and freeing the Python reference would leave the replay reading
+        # reclaimed memory
+        self._verify_graph_args = []
+        # NOTE: each verify graph gets its OWN memory pool. Sharing a pool
+        # across the verify graphs (as the decode graphs do) silently broke
+        # the first-captured graph's replay on this torch build; verify
+        # activations are tiny, so separate pools cost almost nothing.
+        batch_sizes = sorted(
+            {size for size in [1, 2, 4, 8, *range(16, max_bs + 1, 16), max_bs] if size <= max_bs},
+            reverse=True,
+        )
+        for batch_size in batch_sizes:
+            n_rows = batch_size * (k + 1)
+            cu = torch.arange(0, n_rows + 1, k + 1, dtype=torch.int32, device=f'cuda:{self.rank}')
+            graph = torch.cuda.CUDAGraph()
+
+            def _forward():
+                set_context(
+                    is_prefill=True,
+                    is_verify=True,
+                    cu_seqlens_q=cu,
+                    slot_mapping=v_slot_mapping[:n_rows],
+                    context_lens=v_context_lens[:batch_size],
+                    block_tables=v_block_tables[:batch_size],
+                    seqlens_q=[k + 1] * batch_size,
+                    seqlens_k=[1] * batch_size,
+                    positions=v_positions[:n_rows],
+                )
+                hidden = self.model(v_input_ids[:n_rows])
+                logits = self.model.compute_logits(hidden)
+                v_hidden_tap[:n_rows] = hidden
+                v_logits[:n_rows] = logits
+
+            _forward()  # warmup/compile outside capture
+            torch.cuda.synchronize()
+            reset_context()
+            with torch.cuda.graph(graph):  # own pool (see note above)
+                _forward()
+            torch.cuda.synchronize()
+            reset_context()
+            self.verify_graphs[batch_size] = graph
+            self._verify_graph_args.append(cu)
+
+        self.verify_vars = dict(
+            input_ids=v_input_ids,
+            slot_mapping=v_slot_mapping,
+            context_lens=v_context_lens,
+            block_tables=v_block_tables,
+            positions=v_positions,
+            logits=v_logits,
+            hidden_tap=v_hidden_tap,
+            k=k,
+        )
+
+    # verification forward through the captured graph when available
+    @torch.inference_mode()
+    def run_spec_verify(self, seqs: list[Sequence]) -> torch.Tensor:
+        if getattr(self, 'verify_graphs', None):
+            return self._run_spec_verify_graph(seqs)
+        input_ids = self.prepare_spec_verify(seqs)
+        hidden_states = self.model(input_ids)
+        logits = self.model.compute_logits(hidden_states)
+        reset_context()
+        return logits
+
+    def _run_spec_verify_graph(self, seqs: list[Sequence]) -> torch.Tensor:
+        vars_ = self.verify_vars
+        k = vars_['k']
+        bs = len(seqs)
+        graph = self.verify_graphs[min(b_ for b_ in self.verify_graphs if b_ >= bs)]
+
+        input_ids, slot_mappings, positions, context_lens = [], [], [], []
+        max_num_blocks = vars_['block_tables'].size(1)
+        for seq in seqs:
+            table = getattr(seq, self.table_attr)
+            context_lens.append(len(seq))
+            n = len(seq) - len(seq.draft_tokens)
+            for pos in range(n - 1, len(seq)):
+                input_ids.append(seq.token_ids[pos])
+                positions.append(pos)
+                block_idx = pos // self.block_size
+                slot_mappings.append(
+                    table[block_idx] * self.block_size + pos % self.block_size
+                )
+            # pad this sequence's rows up to the captured K+1
+            for _ in range(len(seq.draft_tokens) + 1, k + 1):
+                input_ids.append(0)
+                positions.append(-1)
+                slot_mappings.append(-1)
+
+        block_tables = torch.full((bs, max_num_blocks), -1, dtype=torch.int32)
+        for i, seq in enumerate(seqs):
+            table = getattr(seq, self.table_attr)
+            block_tables[i, : len(table)] = torch.as_tensor(table, dtype=torch.int32)
+
+        rows = bs * (k + 1)
+        vars_['input_ids'][:rows].copy_(torch.tensor(input_ids, dtype=torch.long))
+        vars_['slot_mapping'].fill_(-1)
+        vars_['slot_mapping'][:rows].copy_(torch.tensor(slot_mappings, dtype=torch.long))
+        vars_['positions'].fill_(-1)
+        vars_['positions'][:rows].copy_(torch.tensor(positions, dtype=torch.long))
+        # padded batch rows must be inert when an oversized graph is replayed
+        vars_['context_lens'].zero_()
+        vars_['context_lens'][:bs].copy_(torch.tensor(context_lens, dtype=torch.long))
+        vars_['block_tables'].fill_(-1)
+        vars_['block_tables'][:bs, : block_tables.size(1)].copy_(block_tables)
+
+        graph.replay()
+        return vars_['logits'][:rows]

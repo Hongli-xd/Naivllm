@@ -28,35 +28,43 @@ class Scheduler:
         # try schedule for prefilling from waiting queue if not exceeding limits
         while self.waiting and len(scheduled_sequences) < self.max_num_sequences:
             seq = self.waiting[0]
-            if self.block_manager.can_allocate(seq) and len(seq) + current_scheduled_tokens <= self.max_num_batched_tokens:
+            # budget counts only tokens that still need a forward pass,
+            # i.e. prompt tokens not served by the prefix cache
+            new_tokens = len(seq) - seq.num_cached_tokens
+            if self.block_manager.can_allocate(seq) and new_tokens + current_scheduled_tokens <= self.max_num_batched_tokens:
                 seq = self.waiting.popleft() # remove from waiting
                 self.block_manager.allocate(seq)
                 seq.status = SequenceStatus.RUNNING
                 self.running.append(seq)
                 scheduled_sequences.append(seq)
-                current_scheduled_tokens += len(seq)
+                current_scheduled_tokens += new_tokens
             else:
                 break
         if scheduled_sequences:
             return scheduled_sequences, True
-        
+
         # try schedule for completion from running queue
-        while self.running:
-            seq = self.running.popleft()
-            # use can_append to check whether we can append one more token
+        while (
+            self.running
+            and current_scheduled_tokens < self.max_num_batched_tokens
+            and len(scheduled_sequences) < self.max_num_sequences
+        ):
+            seq = self.running[0]
+            # use can_append to check whether we can append one more token;
+            # if not, preempt the lowest-priority running sequence to free
+            # blocks and retry. If seq itself is the lowest priority, preempt
+            # it and stop.
             if not self.block_manager.can_append(seq):
-                if self.running:
-                    self.preempt(self.running.pop())
-                else:
-                    self.preempt(seq)
+                victim = self.running.pop()  # lowest priority = last in queue
+                self.preempt(victim)
+                if victim is seq:
                     break
-            else:
-                if current_scheduled_tokens >= self.max_num_batched_tokens or len(scheduled_sequences) >= self.max_num_sequences:
-                    break
-                # append one token
-                self.block_manager.append(seq)
-                scheduled_sequences.append(seq)
-                current_scheduled_tokens += 1 # only one token for completion
+                continue
+            # append one token
+            self.block_manager.append(seq)
+            scheduled_sequences.append(seq)
+            current_scheduled_tokens += 1 # only one token for completion
+            self.running.popleft()
 
         # re-add to running queue in the same order
         if scheduled_sequences:

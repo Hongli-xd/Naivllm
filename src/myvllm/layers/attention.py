@@ -431,23 +431,25 @@ def paged_attention_decode_kernel(
                 + offs_d[None, :]
             )
             k = tl.load(k_cache_ptr + kv_offsets, mask=valid[:, None], other=0.0)
-            qk = tl.sum(k * q[None, :], axis=1) * scale
+            # fp32 accumulation: a bf16 tl.sum reduction loses ~1.0 of
+            # precision on attention logits and flips argmax on flat
+            # distributions (tl.dot paths accumulate in fp32 already)
+            qk = tl.sum(k.to(tl.float32) * q.to(tl.float32)[None, :], axis=1) * scale
             qk = tl.where(valid, qk, -1e10)
-            
+
             # Online softmax
             m_ij = tl.max(qk)
             m_i_new = tl.maximum(m_i, m_ij)
             alpha = tl.exp(m_i - m_i_new)
             p = tl.exp(qk - m_i_new)
-            
+
             # Rescale accumulator
             acc = acc * alpha
             l_i = l_i * alpha
-            
+
             v = tl.load(v_cache_ptr + kv_offsets, mask=valid[:, None], other=0.0)
-            acc += tl.sum(p[:, None].to(v.dtype) * v, axis=0)
+            acc += tl.sum(p[:, None].to(tl.float32) * v.to(tl.float32), axis=0)
             l_i += tl.sum(p)
-            
             m_i = m_i_new
     
     # Normalize
@@ -516,6 +518,156 @@ def paged_attention_decode(
     return output
 
 
+@triton.jit
+def paged_attention_verify_kernel(
+    output_ptr,
+    query_ptr,
+    k_cache_ptr,
+    v_cache_ptr,
+    block_tables_ptr,
+    context_lens_ptr,
+    cu_seqlens_q_ptr,
+    q_positions_ptr,
+    scale,
+    num_heads: tl.constexpr,
+    num_kv_heads: tl.constexpr,
+    head_dim: tl.constexpr,
+    block_size: tl.constexpr,
+    max_num_blocks: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    """Multi-query paged decode used by speculative-decoding verification.
+
+    Each program handles up to BLOCK_M query rows (the drafted tokens of one
+    sequence) for one head. Queries are masked causally through their
+    absolute positions so a chunk of K+1 drafted tokens is verified with one
+    kernel launch per layer, against the full paged KV cache.
+    """
+    batch_idx = tl.program_id(0)
+    head_idx = tl.program_id(1)
+    kv_head_idx = head_idx // (num_heads // num_kv_heads)
+
+    # query rows of this sequence live at [cu_q[batch], cu_q[batch+1])
+    q_start = tl.load(cu_seqlens_q_ptr + batch_idx)
+    q_end = tl.load(cu_seqlens_q_ptr + batch_idx + 1)
+    q_len = q_end - q_start
+
+    context_len = tl.load(context_lens_ptr + batch_idx)
+
+    offs_m = tl.arange(0, BLOCK_M)
+    offs_d = tl.arange(0, head_dim)
+    q_mask = offs_m < q_len
+    rows = q_start + offs_m
+    # absolute position of each query row (-1 padding keeps the row inert)
+    q_pos = tl.load(q_positions_ptr + rows, mask=q_mask, other=-1)
+
+    q_ptrs = rows[:, None] * num_heads * head_dim + head_idx * head_dim + offs_d[None, :]
+    q = tl.load(query_ptr + q_ptrs, mask=q_mask[:, None], other=0.0)
+
+    acc = tl.zeros([BLOCK_M, head_dim], dtype=tl.float32)
+    l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
+    m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - 1e10
+
+    max_chunks = tl.cdiv(max_num_blocks * block_size, BLOCK_N)
+    for chunk_idx in range(max_chunks):
+        token_start = chunk_idx * BLOCK_N
+        if token_start < context_len:
+            offs_n = token_start + tl.arange(0, BLOCK_N)
+            mask_n = offs_n < context_len
+
+            block_num = offs_n // block_size
+            block_offset = offs_n % block_size
+            table_offsets = batch_idx * max_num_blocks + block_num
+            physical_blocks = tl.load(table_offsets + block_tables_ptr, mask=mask_n, other=-1)
+            valid = mask_n & (physical_blocks >= 0)
+            kv_offsets = (
+                physical_blocks[:, None] * block_size * num_kv_heads * head_dim
+                + block_offset[:, None] * num_kv_heads * head_dim
+                + kv_head_idx * head_dim
+                + offs_d[None, :]
+            )
+            k = tl.load(k_cache_ptr + kv_offsets, mask=valid[:, None], other=0.0)
+            # (BLOCK_M, BLOCK_N)
+            qk = tl.dot(q, tl.trans(k)) * scale
+            # causal mask through absolute positions: query at position p
+            # attends exactly to keys 0..p
+            causal = (q_pos[:, None] >= offs_n[None, :]) & valid[None, :] & q_mask[:, None]
+            qk = tl.where(causal, qk, -1e10)
+
+            m_ij = tl.max(qk, axis=1)
+            m_i_new = tl.maximum(m_i, m_ij)
+            alpha = tl.exp(m_i - m_i_new)
+            p = tl.exp(qk - m_i_new[:, None])
+
+            acc = acc * alpha[:, None]
+            l_i = l_i * alpha
+
+            v = tl.load(v_cache_ptr + kv_offsets, mask=valid[:, None], other=0.0)
+            acc = acc + tl.dot(p.to(v.dtype), v)
+            l_i += tl.sum(p, axis=1)
+            m_i = m_i_new
+
+    output = acc / l_i[:, None]
+    tl.store(output_ptr + q_ptrs, output.to(output_ptr.dtype.element_ty), mask=q_mask[:, None])
+
+
+def paged_attention_verify(
+    query: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    block_tables: torch.Tensor,
+    context_lens: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    positions: torch.Tensor,
+    scale: float,
+    num_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    block_size: int,
+    block_m: int,
+) -> torch.Tensor:
+    """Verify a chunk of drafted tokens against the paged KV cache.
+
+    Args:
+        query: (total_query_tokens, num_heads, head_dim)
+        block_tables: (batch_size, max_num_blocks)
+        context_lens: (batch_size,) full KV length per sequence
+        cu_seqlens_q: (batch_size + 1,) cumulative query lengths
+        positions: (total_query_tokens,) absolute position of each query row
+        block_m: padded per-sequence query tile (power of two, >= max q_len)
+    Returns:
+        output: (total_query_tokens, num_heads, head_dim)
+    """
+    batch_size = block_tables.shape[0]
+    max_num_blocks = block_tables.shape[1]
+    query = query.contiguous()
+
+    output = torch.empty_like(query)
+    BLOCK_N = 64 if head_dim <= 128 else 32
+    grid = (batch_size, num_heads)
+
+    paged_attention_verify_kernel[grid](
+        output,
+        query,
+        k_cache,
+        v_cache,
+        block_tables,
+        context_lens,
+        cu_seqlens_q,
+        positions,
+        scale,
+        num_heads=num_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        block_size=block_size,
+        max_num_blocks=max_num_blocks,
+        BLOCK_M=block_m,
+        BLOCK_N=BLOCK_N,
+    )
+    return output
+
+
 class Attention(nn.Module):
     def __init__(
         self,
@@ -554,6 +706,29 @@ class Attention(nn.Module):
             store_kvcache(k_to_store, v_to_store, k_cache, v_cache, context.slot_mapping, self.block_size)
 
         scale = self.scale / (self.head_dim ** 0.5)
+
+        if context.is_verify:
+            # Speculative-decoding verification: a chunk of drafted tokens
+            # attends to the full paged KV cache with a causal mask derived
+            # from absolute positions.
+            max_q_len = max(context.seqlens_q)
+            block_m = max(16, triton.next_power_of_2(max_q_len))
+            o = paged_attention_verify(
+                q,
+                k_cache,
+                v_cache,
+                context.block_tables,
+                context.context_lens,
+                context.cu_seqlens_q,
+                context.positions,
+                scale,
+                self.num_heads,
+                self.num_kv_heads,
+                self.head_dim,
+                self.block_size,
+                block_m,
+            )
+            return o.reshape(o.shape[0], self.num_heads * self.head_dim)
 
         if context.is_prefill:
             # Prefill: use flash attention

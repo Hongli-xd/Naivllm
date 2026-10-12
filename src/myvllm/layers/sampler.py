@@ -12,8 +12,13 @@ class SamplerLayer(nn.Module):
         super().__init__()
 
     def forward(self, logits: torch.Tensor, temperature: torch.Tensor) -> torch.Tensor:
-        scaled_logits = logits / temperature.unsqueeze(-1)
+        # temperature == 0 means greedy decoding (argmax); required for
+        # deterministic outputs and standard speculative-decoding verification
+        greedy = temperature <= 1e-6
+        safe_temperature = torch.where(greedy, torch.ones_like(temperature), temperature)
+        argmax_tokens = logits.argmax(dim=-1)
+        scaled_logits = logits / safe_temperature.unsqueeze(-1)
         probs = torch.softmax(scaled_logits, dim=-1)
         noise = torch.empty_like(probs).exponential_(1).clamp_min_(1e-10)
         sample_tokens = (probs / noise).argmax(dim=-1)
-        return sample_tokens
+        return torch.where(greedy, argmax_tokens, sample_tokens)

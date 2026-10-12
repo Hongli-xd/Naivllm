@@ -219,7 +219,11 @@ class RowParallelLinear(LinearBase):
         param_data.copy_(slided_weight)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        result = nn.functional.linear(x, self.weight, self.bias)
+        # under TP the partial results are summed across ranks, so the bias
+        # must be added exactly once (on rank 0); otherwise it would be
+        # counted world_size times
+        bias = self.bias if self.tp_rank == 0 else None
+        result = nn.functional.linear(x, self.weight, bias)
         if self.tp_size > 1:
             dist.all_reduce(result, op=dist.ReduceOp.SUM)
         return result

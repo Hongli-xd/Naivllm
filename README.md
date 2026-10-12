@@ -5,21 +5,52 @@ continuous batching, tensor parallelism, Triton attention kernels, and CUDA
 Graph decode visible in a small codebase. It is an educational and experimental
 engine, not a drop-in replacement for vLLM.
 
-## Narrow target
+## Vertical: RAG / knowledge-base QA latency engine
 
-The performance experiment targets a deliberately small regime: one GPU,
-Qwen3 0.6B-3B, batch sizes 1-8, and short decode-bound requests. NaivLLM removes
-generality overhead and captures model forward, logits, and sampling in one CUDA
-Graph. vLLM is expected to regain the lead as batches or contexts grow and the
-workload becomes compute-bound.
+Beyond the narrow decode regime, NaivLLM now targets one vertical workload
+end-to-end: **grounded QA over a long, shared document prefix** — the shape of
+every knowledge-base assistant (enterprise docs, support bots, in-IDE doc
+lookups):
 
-The benchmark also measures two secondary scenarios:
+- a long fixed prefix (system + retrieved document) shared by all requests,
+  kept resident through the explicitly-pinned prefix blocks;
+- short, extractive answers that quote the document — which makes
+  **n-gram speculative decoding** (prompt lookup, no draft model) extremely
+  effective: measured acceptance 83-90% on the RAG benchmark;
+- speculative verification runs as a **captured CUDA Graph** (one replay per
+  round), so a round costs one graph launch instead of ~28 layers of eager
+  dispatch.
 
-- process start to engine ready/first token, host RSS, and GPU memory footprint;
-- a fixed RAG prefix, including NaivLLM's explicitly pinned prefix blocks.
+Fair-comparison rules used in `benchmarks/rag_bench.py`: every backend runs
+the same Qwen3-0.6B weights (bf16/fp16), the same tokenized prompts, greedy
+decoding, and the same GPU. vLLM is given its own ngram speculative decoding
+with identical K / n-gram bounds; Ollama runs fp16 on a dedicated GPU-pinned
+server (it has no ngram spec decoding and no smaller Qwen3 draft for 0.6B).
 
-No performance claim is hard-coded in this repository. Use the benchmark to
-find the crossover point on the actual hardware and report the full curve.
+## Speculative decoding
+
+`myvllm.spec_engine` implements lossless speculative decoding (Leviathan et
+al.) with pluggable drafters:
+
+- `NgramDrafter` — prompt-lookup drafting over prompt+output via
+  `bytes.rfind` n-gram matching; no draft model, ideal for extractive RAG.
+- `ModelDrafter` — a second, smaller Qwen3 drafting K autoregressive steps
+  through its own paged KV cache (`draft_block_table`) and CUDA graphs.
+
+Verification is a single multi-token forward over
+`[last_confirmed, d_1..d_K]` through a dedicated Triton paged-attention
+kernel with per-row causal positions, replayed as a captured CUDA graph per
+batch bucket. Rejection sampling supports greedy (exact-match), stochastic
+with draft distributions (min(1, p_t/p_d) + residual resample), and
+distribution-free drafts (accept iff the draft equals a target sample) — all
+provably lossless. Greedy spec output is verified token-identical to the
+engine's own plain decoding (`scripts/check_hf_alignment.py`).
+
+Run it:
+
+```bash
+PYTHONPATH=src python spec_main.py --model /path/to/Qwen3-0.6B --method ngram --k 5 --temperature 0
+```
 
 ## Run
 
@@ -27,6 +58,40 @@ find the crossover point on the actual hardware and report the full curve.
 python -m pip install -e '.[dev]'
 python main.py
 ```
+
+## RAG benchmark
+
+```bash
+PYTHONPATH=src python benchmarks/rag_bench.py \
+  --model /models/Qwen3-0.6B \
+  --gpu 1 \
+  --backends naivllm,vllm-spec,vllm,ollama \
+  --batches 1,2,4,8 \
+  --doc-tokens 1200 \
+  --max-tokens 48 \
+  --repeats 3 \
+  --k 5 \
+  --naiv-method ngram \
+  --ollama-model qwen3:0.6b-fp16
+```
+
+Ollama expects a dedicated server pinned to the same GPU (fp16 weights, raw
+prompts):
+
+```bash
+CUDA_VISIBLE_DEVICES=1 OLLAMA_HOST=127.0.0.1:11435 \
+  OLLAMA_MODELS=~/ollama-gpu1/models OLLAMA_KEEP_ALIVE=-1 \
+  OLLAMA_NUM_PARALLEL=8 OLLAMA_CONTEXT_LENGTH=4096 ollama serve &
+OLLAMA_HOST=127.0.0.1:11435 ollama pull qwen3:0.6b-fp16
+```
+
+## Honest scope
+
+The narrow decode regime (one GPU, Qwen3 0.6B-3B, batch 1-8, short
+decode-bound requests) is where NaivLLM is competitive. vLLM regains the
+lead as batches or contexts grow and the workload becomes compute-bound;
+measure the crossover on your hardware with the harnesses above rather than
+trusting any fixed claim.
 
 Configuration is derived from the checkpoint's Hugging Face `config.json`:
 

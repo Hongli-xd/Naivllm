@@ -31,6 +31,12 @@ class Sequence:
         self.num_cached_tokens = 0
         # block_table
         self.block_table = []
+        # speculative-decoding draft-side state, managed by a separate
+        # BlockManager when a draft model is used
+        self.draft_block_table = []
+        self.draft_num_cached_tokens = 0
+        # tokens drafted for the current speculative round (transient)
+        self.draft_tokens = []
         # sampling_params' related things
         self.temperature = sampling_params.temperature
         self.max_tokens = sampling_params.max_tokens
