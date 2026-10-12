@@ -1,0 +1,38 @@
+[
+  {
+    "backend": "naivllm",
+    "init_s": 7.335170489037409,
+    "doc_tokens": 1200,
+    "max_tokens": 48,
+    "rows": [
+      {
+        "batch_size": 1,
+        "wall_s": 0.24190420599188656,
+        "output_tokens": 48,
+        "output_tps": 198.42565284544872,
+        "spec": null
+      },
+      {
+        "batch_size": 2,
+        "wall_s": 0.2704611359513365,
+        "output_tokens": 96,
+        "output_tps": 354.9493337086075,
+        "spec": null
+      },
+      {
+        "batch_size": 4,
+        "wall_s": 0.29283212701557204,
+        "output_tokens": 192,
+        "output_tps": 655.6657630321756,
+        "spec": null
+      },
+      {
+        "batch_size": 8,
+        "wall_s": 0.33439894497860223,
+        "output_tokens": 384,
+        "output_tps": 1148.328981793204,
+        "spec": null
+      }
+    ]
+  }
+]

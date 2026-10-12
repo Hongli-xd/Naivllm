@@ -1,0 +1,174 @@
+[
+  {
+    "backend": "naivllm",
+    "init_s": 7.687433099956252,
+    "doc_tokens": 1200,
+    "max_tokens": 48,
+    "rows": [
+      {
+        "batch_size": 1,
+        "wall_s": 0.10624294902663678,
+        "output_tokens": 48,
+        "output_tps": 451.7946879276256,
+        "spec": {
+          "method": "ngram",
+          "num_speculative_tokens": 8,
+          "rounds": 44,
+          "drafted_tokens": 160,
+          "accepted_tokens": 117,
+          "fallback_rounds": 0
+        }
+      },
+      {
+        "batch_size": 2,
+        "wall_s": 0.18139722500927746,
+        "output_tokens": 96,
+        "output_tps": 529.2252954536109,
+        "spec": {
+          "method": "ngram",
+          "num_speculative_tokens": 8,
+          "rounds": 107,
+          "drafted_tokens": 520,
+          "accepted_tokens": 330,
+          "fallback_rounds": 0
+        }
+      },
+      {
+        "batch_size": 4,
+        "wall_s": 0.24543048505438492,
+        "output_tokens": 192,
+        "output_tps": 782.2989061748166,
+        "spec": {
+          "method": "ngram",
+          "num_speculative_tokens": 8,
+          "rounds": 184,
+          "drafted_tokens": 1208,
+          "accepted_tokens": 759,
+          "fallback_rounds": 0
+        }
+      },
+      {
+        "batch_size": 8,
+        "wall_s": 0.33366969897178933,
+        "output_tokens": 384,
+        "output_tps": 1150.838692225589,
+        "spec": {
+          "method": "ngram",
+          "num_speculative_tokens": 8,
+          "rounds": 253,
+          "drafted_tokens": 2624,
+          "accepted_tokens": 1647,
+          "fallback_rounds": 0
+        }
+      }
+    ]
+  },
+  {
+    "backend": "vllm-spec",
+    "init_s": 21.672447043005377,
+    "doc_tokens": 1200,
+    "max_tokens": 48,
+    "rows": [
+      {
+        "batch_size": 1,
+        "wall_s": 0.1037673510145396,
+        "output_tokens": 48,
+        "output_tps": 462.57324226455745,
+        "spec": null
+      },
+      {
+        "batch_size": 2,
+        "wall_s": 0.13734468299662694,
+        "output_tokens": 96,
+        "output_tps": 698.971360998064,
+        "spec": null
+      },
+      {
+        "batch_size": 4,
+        "wall_s": 0.15034305403241888,
+        "output_tokens": 192,
+        "output_tps": 1277.0792853429632,
+        "spec": null
+      },
+      {
+        "batch_size": 8,
+        "wall_s": 0.17082018998917192,
+        "output_tokens": 384,
+        "output_tps": 2247.977829929479,
+        "spec": null
+      }
+    ]
+  },
+  {
+    "backend": "vllm",
+    "init_s": 19.77130645600846,
+    "doc_tokens": 1200,
+    "max_tokens": 48,
+    "rows": [
+      {
+        "batch_size": 1,
+        "wall_s": 0.1088389820070006,
+        "output_tokens": 48,
+        "output_tps": 441.0184578620242,
+        "spec": null
+      },
+      {
+        "batch_size": 2,
+        "wall_s": 0.13407417200505733,
+        "output_tokens": 96,
+        "output_tps": 716.02157644784,
+        "spec": null
+      },
+      {
+        "batch_size": 4,
+        "wall_s": 0.1537319750059396,
+        "output_tokens": 192,
+        "output_tps": 1248.9269066671516,
+        "spec": null
+      },
+      {
+        "batch_size": 8,
+        "wall_s": 0.1680801309994422,
+        "output_tokens": 384,
+        "output_tps": 2284.6245877882757,
+        "spec": null
+      }
+    ]
+  },
+  {
+    "backend": "ollama",
+    "init_s": 0.10422340896911919,
+    "doc_tokens": 1200,
+    "max_tokens": 48,
+    "rows": [
+      {
+        "batch_size": 1,
+        "wall_s": 0.5046626229886897,
+        "output_tokens": 48,
+        "output_tps": 95.11304743699189,
+        "spec": null
+      },
+      {
+        "batch_size": 2,
+        "wall_s": 0.777501464006491,
+        "output_tokens": 96,
+        "output_tps": 123.47243631582222,
+        "spec": null
+      },
+      {
+        "batch_size": 4,
+        "wall_s": 1.3145523419952951,
+        "output_tokens": 192,
+        "output_tps": 146.05732603128797,
+        "spec": null
+      },
+      {
+        "batch_size": 8,
+        "wall_s": 2.3431961630121805,
+        "output_tokens": 384,
+        "output_tps": 163.87872516245832,
+        "spec": null
+      }
+    ]
+  }
+]
