@@ -203,7 +203,164 @@ KV Cache 量化（fp8）优先于权重（KV 是显存大头且影响批容量�
 注意 decode kernel 的加载类型与 online softmax 精度、以及 lm_head
 的采样对 logit 精度敏感（呼应 E1 的 bf16 翻转教训）。
 
-## I. 反问与表达建议
+---
+
+## J. 超大规模集群调度（PD 分离 / 全局缓存 / 多租户）— 纵深章
+
+> 与 H 的分工：H 是"单引擎在线化"；本章是**多实例/多机/集群**。
+> 这是 infra 高级岗的区分题，答得出框架 + 权衡即领先。
+
+**J1 ★★★ 千卡集群上，prefill 和 decode 为什么、怎么分开调度？**
+考点：PD 分离（Disaggregated Serving，DistServe/Mooncake 路线）。
+要点：①动机——两者资源形态相反：prefill 是 compute-bound（大 GEMM，
+吃 MFU），decode 是 memory-bound（小 GEMM + 大 KV 读，吃带宽/批容量），
+混部时互相干扰：长 prefill 卡住同批 decode 的 TPOT、decode 大批又让
+prefill 的算力闲置；②架构——P/D 两组实例 + 请求路由层，prefill 完
+成后把 KV 传给 decode 组；③收益——各自独立扩缩容、独立批策略、
+SLO（TTFT 由 P 组保、TPOT 由 D 组保）解耦；④代价——KV 跨实例传
+输（见 J3）与调度复杂度；⑤过渡形态——单机内 chunked prefill
+（vLLM V1）是"部分分离"，先答它再升级到跨机分离，显得有层次。
+追问"什么规模才值得 PD 分离"：KV 传输时间 < 干扰损失时才赚，小
+模型/单卡不值（我们引擎正是后者，如实说）。
+
+**J2 ★★★ 十万级并发的请求怎么路由到"对的"推理实例？**
+考点：prefix-aware / cache-aware routing。要点：①朴素 LB（round-
+robin/最少连接）会打散前缀复用——同一文档的请求分到无缓存的实例，
+TTFT 翻倍；②做法：对 prompt 前缀块哈希（我们引擎的 xxhash 链式
+指纹可直接复用为路由 key），一致性哈希把"同前缀请求"粘到同实例；
+③SGLang 式 cache-aware LB：实例回报 radix-tree 命中率，路由器按
+"预计命中长度"加权打分，兼顾负载均衡与命中率的权衡；④全局索引
+的代价：路由表本身是一致性难题（实例下线/淘汰），Mooncake 用
+中心 KV pool + 元数据服务解。追问"缓存抖动怎么办"：二级策略
+（命中优先但过载则溢出到冷实例）。
+
+**J3 ★★ KV Cache 跨实例传输，具体传什么、多大、怎么不挡路？**
+要点：①只传本次会话的 KV（如 8k token × 每层），量级 =
+2×layers×kv_heads×head_dim×2B×len（Qwen3-8B、8k 上下文 ≈ 1.2 GB）；
+②与 prefill 流水——逐层传（layer i 算完即发），RDMA/NCCL P2P，
+与剩余层的计算 overlap；
+③decode 侧"先到先起跑"或等待齐全的取舍；④追问：为什么不重算？
+——重算成本 = prefill FLOPs，通常高于一次网络传输（尤其 RDMA），
+但跨机房就反转。能把我们"块 16 token 粒度"的 KV 布局说成"传输
+天然分片单元"是加分项。
+
+**J4 ★★ 怎么用排队论做容量规划与 SLO 保障？**
+要点：①指标体系：TTFT P99 / TPOT / goodput（满足 SLO 的有效吞吐，
+vLLM 对外常用）；②Little's law：在途请求数 = 到达率 × 停留时间，
+反推并发上限与实例数；③decode 是准批服务（batch 周期 ~十 ms 级），
+可用 M/G/c 近似估排队延迟，P 实例用 GPU 时间片估；④闭环：在线
+扩缩容按队列长度 + SLO 违约率反馈。诚实说我们基准只有离线吞吐，
+在线 SLO 是路线图——但能说出体系本身就过这题。
+
+**J5 ★★ 多租户共享 GPU 怎么隔离？互相干扰哪个最疼？**
+要点：①选项——MIG（硬件级切分，显存/SM 隔离最硬但碎片化）、
+time-slicing（简单，尾延迟抖动大）、batch 内混跑（vLLM 多 LoRA
+式，利用率最高但干扰最强）；②干扰源——decode 大批抢占带宽/
+L2、prefill 的 SM 占满让邻居 decode 的 kernel 排队；③实践中
+"关键租户独占 + 弹性租户混跑"分级。呼应：我们单引擎单租户，
+TPOT 稳定性靠 CUDA Graph 的确定性执行时间保证。
+
+**J6 ★ 弹性伸缩的冷启动问题怎么解？（我们能抢答）**
+要点：scale-to-zero 后重启的代价 = 权重加载 + 图捕获 + KV 预热；
+我们的数字：3.1s vs vLLM 44.9s——因为图捕获少（桶少）且无编译
+栈；进一步方向：Mooncake 式 KV 持久化池（重启不丢前缀）、权重
+mmap 常驻 page cache、模型预加载 sidecar。
+
+**J7 ★ 序列热迁移 / 故障恢复怎么做？**
+要点：序列状态 = token_ids + block_table + KV 数据；迁移 = 传 KV
+（同 J3）+ 状态快照；故障恢复的两级——请求级重放（幂等，代价小）
+vs 检查点续推（省算但工程重）；诚实：我们引擎未做，但 trim/rollback
+机制说明"序列状态可重建"这一前提已经具备。
+
+## K. 前沿架构与论文（考知识面与追踪能力）
+
+> 与 C 的分工：C 讲我们实现的投机解码；K2 只做**横向对比**。
+
+**K1 ★★★ MLA（DeepSeek）与 GQA/MQA 的本质区别？对推理栈的影响？**
+要点：①MQA/GQA 压缩 KV 的"头"维（H/Hkv 倍），MLA 把 KV 投影到
+低秩潜在空间（kv_lora_rank），K/V 不单独存、attention 时从 latent
+升维；②收益——KV 再降一个量级（DeepSeek-V3 单 token KV 70KB 级），
+decode 批容量大增；③代价——与 RoPE 的位置耦合要拆分（nope/rope
+两部分），FlashAttention 形态要改（重量化 FA 的 support 是热点），
+paged cache 存的是 latent 块；④答出"MLA 本质 = attention 版 LoRA
+式低秩分解"这句就到位。
+
+**K2 ★★★ 四代投机解码横向对比：n-gram / draft-model / Medusa / EAGLE / MTP**
+要点：①n-gram：零模型成本，上限受"输出复述上下文比例"钳制
+（我们实测 63–90% 就是这个比例）；②draft-model（我们已实现）：
+通用但串行 K 次前向 + 双模型显存；③Medusa：目标模型加多个解码头
+一次前出树，省串行但头要训练；④EAGLE：在特征层自回归（低维
+hidden 而非 token），接受率最高，DeepSeek-V3 的 MTP 是其工程化
+（训练时就带下一 token 预测头）；⑤选型结论：RAG 类抽取负载
+n-gram 性价比无敌；通用 chat 才值得 EAGLE/MTP。
+追问"树投机 vs 链投机"：树提高每轮期望接受数，代价验证 kernel
+要支持树形因果掩码（我们 verify kernel 的逐行掩码是它的退化
+直线形态）。
+
+**K3 ★★ MoE 推理的通信瓶颈与 DeepEP？**
+要点：①MoE 每 token 按路由发到专家——all-to-all 代替 allreduce
+成为主通信；②EP（专家并行）下 all-to-all 通信量 ∝ 激活 token 数，
+与 TP 的 per-layer 固定开销不同；③DeepEP 的两个 kernel：normal
+（大 batch 高效 all-to-all）与 low-latency（小 batch 纯 RDMA），
+对应 prefill/decode 两种形态——正好接 J1 的 PD 分离逻辑；④单机
+MoE 也有专家装不下/负载倾斜问题（expert placement）。
+
+**K4 ★★ KV 稀疏化/淘汰（H2O、SnapKV）与 paged cache 的关系？**
+要点：①H2O 按注意力分数保留 top-k 历史 token（驱逐低分），SnapKV
+在 prefill 末尾观察 attention pattern 预选 decode 要保留的列；
+②与分页天然配合——驱逐以"块"为单位释放回池（我们 BlockManager
+的引用计数回收直接复用）；③风险是召回损失（被驱逐 token 后文又
+变重要），所以都是"软"压缩、有比例超参；④与投机解码的组合：
+验证前向要一次读 K+1 行查询的完整 KV，稀疏化后接受率会掉。
+
+**K5 ★ FP8/W8A8 推理落地注意什么？**
+要点：per-tensor vs per-channel scale、dynamic vs static 校准；
+KV fp8 对批容量的放大与 decode kernel 精度（呼应 E1——低精度累
+加翻 argmax 的教训在 fp8 更明显）；DeepSeek-V3 是 fp8 训推一体的
+标杆；量化的正确性验证方法 = 困惑度回归 + 逐层 cos-sim 对比。
+
+**K6 ★ vLLM V1 / overlap scheduler 快在哪？**
+要点：CPU 调度（python 选批、建表、拷数据）与 GPU 上一步的执行
+重叠——batch i 在 GPU 跑时 CPU 已备好 batch i+1，消除了我们引擎
+每步的同步间隙（我们 A2 里输掉的 1.4–2× 主要就在这）；配合
+piecewise CUDA Graph（不同 batch 桶拼装）；说得出"我们 benchmark
+测到的 gap 与该机制的因果"即是把项目与前沿对上号。
+
+**K7 ★ Ring/Context Parallel 解决什么？**
+要点：序列维切分，attention 分块环传 KV，解决单卡放不下超长序列
+的激活/KV；与 TP 正交；代价是通信轮数 ∝ 序列长/块大小；我们 H3
+答过的"decode 单 program 串行扫 KV"是它的单卡前哨问题。
+
+## L. 生产化与性能工程
+
+**L1 ★★★ 线上"慢了"，你的完整定位流程？**
+要点（分层漏斗）：①SLO 面板定位层级——队列 vs prefill vs decode
+（TPOT 分解）；②引擎级——每步 token 均时 + batch 曲线，判断是
+launch-bound（图失效/回退 eager？）还是 memory-bound（KV 满了开始
+抢占/重算？）；③kernel 级——nsys 看时间线空隙（间隙=CPU 瓶颈，
+密集小 kernel=launch 瓶颈），ncu 看单 kernel 的带宽利用率（MBU）；
+④判断 memory/compute bound 的算式：bytes_moved / FLOPs 与卡的
+ROUT（如 4090 ~1TB/s : ~165TFLOP）比较。把我们"26ms eager vs 5ms
+实算"的定位过程当案例讲。
+
+**L2 ★★ 推理 SLO 的 goodput 怎么定义与测量？**
+要点：有效吞吐 = 满足（TTFT,TPOT）双 SLO 的完成请求数/秒；测量
+要固定到达过程（泊松注入）而非离线批打满——离线吞吐（我们基准
+的口径）会高估在线 goodput；调参目标从"最大吞吐"变为"SLO 曲线
+膝点"。
+
+**L3 ★ $/M tokens 成本模型怎么算？怎么选型？**
+要点：$/M = 实例时价 ×(SLO 违约下所需实例数)/有效吞吐；把 PD 分
+离、投机、量化都折算进该式做选型（例：投机 +30% 吞吐 vs 多一份
+draft 显存的机会成本）；我们垂直场景的卖点之一是"同卡冷启动快
+→ 缩容到零的成本可行"（J6）。
+
+**L4 ★ 性能回归怎么防劣化？**
+要点：bench-in-CI——固定种子/固定 prompt 集/离线口径下限（我们
+rag_bench 的进程隔离 + 3 次中位即雏形）+ 关键不变式单测（我们的
+CPU 单测：块所有权/调度不变式）；防图退化：捕获耗时与桶数断言。
+
+## M. 反问与表达建议（收尾）
 
 - 主动引导：把话题引向 C1/C2（无损性）和 D2（悬垂指针排查）——
   这是项目里最"值钱"的两段；
@@ -217,9 +374,12 @@ KV Cache 量化（fp8）优先于权重（KV 是显存大头且影响批容量�
 
 | 岗位 JD 关键词 | 对应题 |
 |---|---|
-| vLLM/SGLang 原理 | B1–B4, F1–F3 |
-| 投机解码/草稿模型 | C1–C7 |
+| vLLM/SGLang 原理 | B1–B4, F1–F3, K6 |
+| 投机解码/草稿模型 | C1–C7, K2 |
 | CUDA Graph/Kernel 开发 | D1–D4, E1–E4 |
-| 性能调优/Profiling | E1, D2, A2 |
-| 分布式推理 | G2, H1 |
-| 论文到工程落地 | C1–C3, 5.5 性能账 |
+| 性能调优/Profiling | E1, D2, A2, L1, L4 |
+| 分布式推理（单机多卡） | G2, H1 |
+| 大规模集群/PD 分离/服务化 | J1–J7, L2–L3 |
+| 前沿架构（MLA/MoE/量化/长文本） | K1, K3–K5, K7 |
+| SLO/容量规划/成本 | J4, L1–L4 |
+| 论文到工程落地 | C1–C3, K1–K2, 5.5 性能账 |
