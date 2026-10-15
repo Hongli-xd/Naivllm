@@ -103,6 +103,10 @@ process on the same GPU.
 
 ## Layout
 
+Deep dives: **[docs/TECHNICAL.md](docs/TECHNICAL.md)** (architecture +
+code walkthrough, 简体中文) · **[docs/INTERVIEW.md](docs/INTERVIEW.md)**
+(infra-interview Q&A prep, 简体中文).
+
 ```
 src/myvllm/engine/     scheduler, block manager (prefix cache/pin/trim), model
                        runner (decode+verify CUDA graphs), LLMEngine
