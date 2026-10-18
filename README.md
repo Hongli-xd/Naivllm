@@ -105,7 +105,8 @@ process on the same GPU.
 
 Deep dives: **[docs/TECHNICAL.md](docs/TECHNICAL.md)** (architecture +
 code walkthrough, 简体中文) · **[docs/INTERVIEW.md](docs/INTERVIEW.md)**
-(infra-interview Q&A prep, 简体中文).
+(infra-interview cheat sheet, 简体中文) · **[docs/INTERVIEW-QA.md](docs/INTERVIEW-QA.md)**
+(interview Q&A with beginner-friendly deep explanations, 简体中文).
 
 ```
 src/myvllm/engine/     scheduler, block manager (prefix cache/pin/trim), model
