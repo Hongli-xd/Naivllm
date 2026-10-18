@@ -28,6 +28,27 @@
 要点：定位是"可读的垂直引擎 + 实验平台"；诚实列 unsupported：
 仅 Qwen3、前缀复用 prefill 走慢路径、无量化/前缀 disk cache。
 
+**A4 ★★ 你的三方基准怎么保证公平？踩过哪些坑？**
+考点：benchmark 方法学（简历第 3 条的直接考题）。要点：五同——
+同权重精度（bf16/fp16）、同 token 序列（绕过各自 tokenizer 差异）、
+同 GPU（Ollama 起专用 GPU 绑定实例，避免默认 Q4 量化与 CPU 回退）、
+同解码（贪心，投机解码无损性下结果可比）、进程隔离 + 3 次取中位；
+vLLM 配置**完全对等**的投机参数（K 与 n-gram 上下界一致）。能讲出
+的真实坑：Ollama 默认再套一层 chat template 导致双重模板（要用
+raw 模式）；共享 GPU 邻居负载造成 ±15% 波动（终测背靠背重跑）；
+离线吞吐≠在线 goodput（见 L2）。追问"为什么不报 TTFT"：vLLM 离线
+API 不暴露每请求首 token 时刻，宁缺毋假。
+
+**A5 ★★ 统一采样器怎么设计的？为什么用 Gumbel-max？**
+考点：简历"贪心与温度采样统一采样器"一句。要点：采样路径 =
+`(probs / exponential噪声).argmax`——Gumbel-max 技巧，等价于从
+categorical 分布采样，但**全程是张量运算**，无 `torch.multinomial`
+的宿主同步语义，因此能直接进 CUDA Graph；贪心分支用
+`torch.where(greedy, argmax, gumbel)` 在图内切换，温度=0 时先
+`where` 成 1.0 防除零 NaN（E1 的老教训）。追问"Gumbel-max 为什么
+对"：P(argmax(log p + G)=i)=p_i 是标准结论，工程优点是 kernel
+友好（一次 elementwise + 一次 argmax，无需 scan）。
+
 ## B. Paged KV Cache（基础功）
 
 **B1 ★★★ 画一下 Paged KV Cache：逻辑块/物理块/块表的关系？解决什么问题？**
@@ -155,8 +176,8 @@ prefill 有缓存时走 PyTorch gather 慢路径；我们的价值在"可读 + �
 
 **F1 ★★ prefill 优先还是 decode 优先？TTFT 与 TPOT 怎么权衡？**
 要点：我们 prefill 优先（新请求尽快出首 token）；代价是打断 decode
-批的节奏。vLLM V1 有 chunked prefill 把长 prefill 切片穿插——我们
-未实现，是 batch≥2 输给它的原因之一。
+批的节奏。vLLM V1 用 chunked prefill 把两者混进统一 token 预算
+（机制细节见 I4）——我们未实现，是 batch≥2 输给它的原因之一。
 
 **F2 ★★ 你们的 prefill 预算怎么算？和 vLLM 有何不同？**
 要点：按"新增 token"计费（len − cached），前缀命中的请求几乎零预算
@@ -204,6 +225,75 @@ KV Cache 量化（fp8）优先于权重（KV 是显存大头且影响批容量�
 的采样对 logit 精度敏感（呼应 E1 的 bf16 翻转教训）。
 
 ---
+
+## I. vLLM 原理机制（对标产品必考）
+
+> 简历里所有数字都以 vLLM 为参照系，考官必然检验你对它的理解
+> 深度。答题技巧：每个机制先答 vLLM 的做法，再一句"我们引擎对
+> 应的位置"，把知识变成对照而非背诵。
+
+**I1 ★★★ vLLM PagedAttention 的核心机制？和操作系统分页的对应关系？**
+要点：块表≈页表（逻辑块→物理块）、BlockManager≈分配器、抢占
+≈swap out、前缀共享≈共享内存。论文三收益：消除外部碎片（KV 的
+显存利用率 ~20%→90%+）、内部碎片 ≤1 块、并行采样分支可共享前缀。
+我们对照：同样的三收益，但**只共享不可变的满块**——追加永远进新
+块，从设计上回避了 vLLM 论文里的 copy-on-write 问题（见 I2）。
+
+**I2 ★★ vLLM 为什么要 copy-on-write？你的实现怎么避开它？**
+要点：vLLM 允许序列 fork（beam search / parallel sampling）共享
+"还在增长的尾块"，两个序列都要往同一物理块写 token → 引用计数 >1
+时谁写谁先复制整块。我们只缓存/共享**内容封死的满块**（哈希注册
+过、永不再写），尾块永远是独占的新分配——用一点共享粒度换掉整个
+CoW 路径；代价是"完全相同的两个活跃前缀"不能合并尾块，RAG 场景
+无感。
+
+**I3 ★★★ vLLM 的 prefix caching 怎么实现？演进过什么方案？**
+要点：v0——满块内容哈希 + 引用计数（与我们同构）；V1——radix
+tree（radix cache）：按 token 前缀建树，命中即沿树拿全部块，叶节点
+LRU 淘汰，天然支持任意长度部分命中与淘汰顺序；默认开启。我们
+对照：块哈希链等价于隐式 radix（父哈希=树边），但没有 LRU——
+块释放即回池，靠 pin_prefix 显式保驻热前缀；改进方向就是 LRU 或
+radix 化（诚实承认差距）。
+
+**I4 ★★ vLLM 调度器的一步做什么？抢占的两种模式？**
+要点：每步：调度批次（受 max_num_seqs / max_num_batched_tokens
+双重限制）→ 前向 → 采样 → 输出处理；FCFS，prefill 优先（V1 用
+chunked prefill 把长 prefill 切进统一 token 预算，prefill/decode
+混批，防长请求饿死 decode——这是它 batch≥2 赢我们的结构性原因，
+呼应 A2/K6）。抢占：recompute（释放全部块，回 waiting 重算，V1
+默认，便宜简单）与 swap（KV 换出 CPU，换回，省重算费显存带宽）；
+我们只实现 recompute（从队尾抢）。
+
+**I5 ★★★ vLLM 的 CUDA Graph 怎么做？为什么是"piecewise"？**
+要点：捕获的是**decoder 层堆叠**这一段形状固定的计算，attention
+与采样留在图外——因为 attention 的块表/序列长度每步都变，自定义
+kernel 难以静态化；输入按 batch 桶 padding，多个图共享显存池。
+对照：我们把 attention（paged decode / 多查询 verify kernel）也
+**放进了图**——块表/长度做成静态张量原地更新即可，连采样都用
+Gumbel-max 图内化（D1/D4）；代价是 padding 行要 -1 哨兵防 KV
+污染（D2 的坑 2）。这段"敢把 attention 进图"是差异化的好故事。
+
+**I6 ★★ vLLM 的投机解码怎么组织？与我们差异？**
+要点：组件化——proposer（ngram = prompt-lookup 式 top-k 匹配 /
+draft model / EAGLE）+ verifier（target 一次多 token 前向）+ GPU
+上批量 rejection sampler；V1 里投机批与普通批统一调度（spec-decode
+worker 不再独立进程）。ngram 的 proposer 用最近 k token 在
+prompt+output 里做多候选匹配（我们的单候选 + 右到左首个命中是
+简化版）。追问"为什么我们单候选也够"：RAG 抽取式输出的复述比例
+高，单链接受率已 63–90%，多候选树的收益要抵消验证变宽的成本。
+
+**I7 ★ vLLM V1 相比 V0 的架构演进？**
+要点（一句话每条）：async 前端（API server 与 engine core 分进程
+解耦）、overlap scheduler（CPU 调度与 GPU 执行错步流水，K6）、
+prefix caching 默认开 + radix、chunked prefill 默认开、piecewise
+CUDA graph、多模态拆到 V2。要点不在背清单，而在把每条跟"我们
+哪里对应/哪里没做"挂钩——这正是 A2/H1/K6 的答题素材。
+
+**I8 ★ vLLM 为什么快？一句话总结它的性能观。**
+要点：把 LLM 推理当作**显存布局与调度问题**而非算子问题——
+PagedAttention 解决"放得下且共享"，continuous batching + chunked
+prefill 解决"GPU 一直有活干"，CUDA graph 解决"派活的开销"。
+我们全盘接受了这个框架，再在垂直负载上加投机解码与全图化验证。
 
 ## J. 超大规模集群调度（PD 分离 / 全局缓存 / 多租户）— 纵深章
 
@@ -374,12 +464,13 @@ CPU 单测：块所有权/调度不变式）；防图退化：捕获耗时与桶
 
 | 岗位 JD 关键词 | 对应题 |
 |---|---|
-| vLLM/SGLang 原理 | B1–B4, F1–F3, K6 |
-| 投机解码/草稿模型 | C1–C7, K2 |
-| CUDA Graph/Kernel 开发 | D1–D4, E1–E4 |
+| vLLM/SGLang 原理 | I1–I8, B1–B4, F1–F3, K6 |
+| 投机解码/草稿模型 | C1–C7, I6, K2 |
+| CUDA Graph/Kernel 开发 | D1–D4, I5, E1–E4 |
 | 性能调优/Profiling | E1, D2, A2, L1, L4 |
+| Benchmark 设计较 | A4–A5, L2 |
 | 分布式推理（单机多卡） | G2, H1 |
 | 大规模集群/PD 分离/服务化 | J1–J7, L2–L3 |
 | 前沿架构（MLA/MoE/量化/长文本） | K1, K3–K5, K7 |
 | SLO/容量规划/成本 | J4, L1–L4 |
-| 论文到工程落地 | C1–C3, K1–K2, 5.5 性能账 |
+| 论文到工程落地 | C1–C3, I1–I5, K1–K2 |
