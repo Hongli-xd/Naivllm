@@ -219,20 +219,31 @@ class SpecLLMEngine(LLMEngine):
             )
 
             # ---- 3. rejection sampling + commit
+            # greedy batches the whole round into ONE argmax + ONE host sync;
+            # stochastic keeps per-seq tensor sampling
+            all_greedy = all(seq.temperature <= 1e-6 for seq in spec_seqs)
+            argmax_tokens = None
+            if all_greedy:
+                argmax_tokens = target_logits.argmax(dim=-1).tolist()
             row = 0
             for i, seq in enumerate(spec_seqs):
                 k_i = len(seq.draft_tokens)
                 rows = target_logits[row : row + k_i + 1]
                 row += stride if stride is not None else k_i + 1
-                draft_rows = (
-                    torch.cat(draft_logit_rows[i]) if draft_logit_rows[i] else None
-                )
-                accepted = self.sampler.verify(
-                    seq.draft_tokens,
-                    rows,
-                    draft_rows,
-                    seq.temperature,
-                )
+                rows_i = draft_logit_rows[i]
+                if isinstance(rows_i, torch.Tensor):
+                    draft_rows = rows_i            # fast path: (k, vocab) view
+                elif rows_i:
+                    draft_rows = torch.cat(rows_i)  # slow path: list of step rows
+                else:
+                    draft_rows = None              # n-gram: no draft distribution
+                if all_greedy:
+                    off = row - (stride if stride is not None else k_i + 1)
+                    accepted = self.sampler.verify(
+                        seq.draft_tokens, argmax_tokens[off : off + k_i + 1])
+                else:
+                    accepted = self.sampler.verify(
+                        seq.draft_tokens, rows, draft_rows, seq.temperature)
                 self._commit(seq, accepted)
 
     def _commit(self, seq, accepted: list[int]) -> None:

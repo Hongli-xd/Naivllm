@@ -125,6 +125,22 @@ class ModelDrafter:
         for seq in seqs:
             self.block_manager.ensure_capacity(seq, len(seq) + k + 1)
         temperatures = self.runner.prepare_sample(seqs)
+
+        fast = (getattr(self.runner, "graphs", None)
+                and self.runner.capture_logits
+                and not self.runner.enforce_eager)
+        if fast:
+            per_seq, logit_buf = self.runner.run_draft_steps_gpu(seqs, k, temperatures)
+            draft_tokens = []
+            for seq, toks in zip(seqs, per_seq):
+                seq.draft_tokens = list(toks)
+                for t in toks:
+                    seq.append_token(t)
+                draft_tokens.append(toks)
+            # per-seq (k, vocab) views of the round-scoped device buffer
+            rows = [logit_buf[:, j, :] for j in range(len(seqs))]
+            return draft_tokens, rows
+
         draft_tokens = [[] for _ in seqs]
         draft_logit_rows = [[] for _ in seqs]
         for _ in range(k):

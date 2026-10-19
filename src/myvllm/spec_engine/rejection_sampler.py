@@ -22,11 +22,10 @@ import torch
 
 
 class RejectionSampler:
-    def verify_greedy(
-        self, draft_tokens: list[int], target_rows: torch.Tensor
-    ) -> list[int]:
-        """target_rows: (K+1, vocab) logits in drafted order."""
-        target_tokens = target_rows.argmax(dim=-1).tolist()
+    def verify_greedy(self, draft_tokens, target_rows) -> list[int]:
+        """target_rows: (K+1, vocab) logits, or a ready (K+1,) token list."""
+        target_tokens = (target_rows if isinstance(target_rows, list)
+                         else target_rows.argmax(dim=-1).tolist())
         accepted = []
         for drafted, target_tok in zip(draft_tokens, target_tokens):
             if drafted != target_tok:

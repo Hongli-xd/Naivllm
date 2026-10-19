@@ -70,16 +70,22 @@ bounds; Ollama runs fp16 on a dedicated GPU-pinned server.
 |---|---|---|---|---|
 | 1.7B | **+76%** | −33% | −31% | n-gram only |
 | 4B  | **+18~23%** | −15% | −17% | n-gram only |
-| 8B  | **+29~50%** | −1%~**+49%** | +6~**+38%** | crossover — model pays |
+| 8B  | +23~83% | +66~**+163%** | +20~**+196%** | hybrid wins everything |
 
 Measured across extractive/reasoning/mixed answer styles (each vs its own
 plain baseline). The breakeven algebra `accepted/round > K·(draft_step/
 target_step) + 1.2` puts the crossover between 4B and 8B for a 0.6B draft
-on this GPU — confirmed on both sides. Notable: when a model stops quoting
-the doc, the n-gram drafter degrades gracefully into a "free bonus token
-per round" mode that never goes negative; vLLM's draft-model spec only
-turns on at 8B too (+81% with its async draft worker — our synchronous
-draft loop is the gap to close). Full JSONs: `benchmark-results/q*_b-*`.
+on this GPU — confirmed on both sides.
+
+At 8B, with the **GPU-resident draft loop** (K draft steps keep tokens on
+device — graph output feeds the next graph input directly; slots/contexts
+pre-staged; one host sync per round), the hybrid cascade is the best mode
+on every workload: **96.5 tok/s at batch 1 on generated-text answers =
+2.96× its own plain, 1.69× vLLM's draft-model spec (57.2), 1.66× vLLM
+plain (58.0)**; acceptance 82-85%, ~4-6 accepted tokens per round. The
+n-gram drafter remains the all-regime safe card (+18~83%), degrading to a
+free-bonus-token mode when output stops quoting the context. Full JSONs:
+`benchmark-results/q*`.
 
 ## Speculative decoding (`myvllm/spec_engine`)
 

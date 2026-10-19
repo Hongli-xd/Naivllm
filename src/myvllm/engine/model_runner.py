@@ -775,3 +775,73 @@ class ModelRunner:
 
         graph.replay()
         return vars_['logits'][:rows]
+
+    # K draft steps fully GPU-resident: the only per-step unknown is the
+    # sampled token, which stays on device (graph output -> graph input
+    # device copy); positions/slots/contexts are deterministic and staged
+    # upfront. Per-step tokens and logits land in device buffers; the host
+    # synchronizes exactly once per round.
+    @torch.inference_mode()
+    def run_draft_steps_gpu(self, seqs: list[Sequence], k: int, temperatures):
+        vars_ = self.graph_vars
+        bs = len(seqs)
+        graph = self.graphs[min(b_ for b_ in self.graphs if b_ >= bs)]
+
+        # deterministic per-step metadata: step i feeds the token at
+        # position (n-1+i) with context (n+i)
+        ctx_rows, slot_rows, first_inputs = [], [], []
+        for seq in seqs:
+            first_inputs.append(seq.last_token)
+        for i in range(k):
+            ctx_rows.append([len(seq) + i + 1 for seq in seqs])
+            slots = []
+            for seq in seqs:
+                table = getattr(seq, self.table_attr)
+                pos = len(seq) - 1 + i
+                block_idx = pos // self.block_size
+                slots.append(table[block_idx] * self.block_size + pos % self.block_size)
+            slot_rows.append(slots)
+
+        dev = f'cuda:{self.rank}'
+        for key, rows in (("draft_ctx", ctx_rows), ("draft_slot", slot_rows)):
+            entry = self._stage.get(key)
+            if entry is None or entry[1].shape[0] < k or entry[1].shape[1] < bs:
+                cpu = torch.empty(max(k, 8), max(bs, 8), dtype=torch.long, pin_memory=True)
+                gpu = torch.empty(cpu.shape, dtype=torch.long, device=dev)
+                self._stage[key] = entry = (cpu, gpu)
+            entry[0][:k, :bs].copy_(torch.tensor(rows, dtype=torch.long))
+            entry[1][:k, :bs].copy_(entry[0][:k, :bs], non_blocking=True)
+        ctx_dev = self._stage["draft_ctx"][1][:k, :bs]
+        slot_dev = self._stage["draft_slot"][1][:k, :bs]
+
+        if getattr(self, "_draft_logits_buf", None) is None or \
+           self._draft_logits_buf.shape[0] < k or self._draft_logits_buf.shape[1] < bs:
+            self._draft_logits_buf = torch.empty(
+                max(k, 8), max(bs, 8), self.config['vocab_size'],
+                dtype=self.default_dtype, device=dev)
+        logit_buf = self._draft_logits_buf[:k, :bs]
+        token_buf = self._stage_1d("draft_tokens", [0] * (k * bs), torch.long)[:k * bs].view(k, bs)
+
+        tables = [getattr(seq, self.table_attr) for seq in seqs]
+        width = max(len(t) for t in tables)
+        bt = self._stage_2d(
+            "dec_bt", [t + [-1] * (width - len(t)) for t in tables], torch.int32)
+
+        vars_['input_ids'][:bs].copy_(torch.tensor(first_inputs, dtype=torch.long))
+        vars_['temperatures'][:bs].copy_(temperatures[:bs])
+        vars_['block_tables'].fill_(-1)
+        vars_['block_tables'][:bs, :width].copy_(bt)
+
+        for i in range(k):
+            vars_['context_lens'][:bs].copy_(ctx_dev[i])
+            vars_['slot_mapping'][:bs].copy_(slot_dev[i])
+            graph.replay()
+            token_buf[i].copy_(vars_['outputs'][:bs])
+            logit_buf[i].copy_(vars_['logits_out'][:bs])
+            if i + 1 < k:
+                # next step's input is this step's sampled token: on device
+                vars_['input_ids'][:bs].copy_(vars_['outputs'][:bs])
+
+        tokens_host = token_buf.cpu()  # single blocking transfer for the round
+        per_seq = [[int(tokens_host[i, j]) for i in range(k)] for j in range(bs)]
+        return per_seq, logit_buf
