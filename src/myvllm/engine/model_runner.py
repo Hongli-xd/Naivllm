@@ -41,6 +41,10 @@ class ModelRunner:
         # draft runners can capture their sampled-token graph output AND the
         # pre-sampling logits (needed for stochastic rejection sampling)
         self.capture_logits = config.get('capture_logits', False)
+        # reusable pinned-CPU + GPU staging buffers: pin_memory allocation
+        # costs ~1ms per tensor and the draft hot path runs prepare several
+        # times per round — allocate once, copy in place
+        self._stage = {}
 
         self.rank = rank
         # A process may host several runners (e.g. draft + target models for
@@ -364,6 +368,41 @@ class ModelRunner:
 
 
     # prepare input data for decoding
+    def _stage_1d(self, key: str, values: list, dtype) -> torch.Tensor:
+        n = len(values)
+        entry = self._stage.get(key)
+        if entry is None or entry[0].numel() < n:
+            cpu = torch.empty(max(n, 64), dtype=dtype, pin_memory=True)
+            gpu = torch.empty(max(n, 64), dtype=dtype, device=f'cuda:{self.rank}')
+            self._stage[key] = entry = (cpu, gpu)
+        cpu, gpu = entry
+        cpu[:n].copy_(torch.as_tensor(values, dtype=dtype))
+        gpu[:n].copy_(cpu[:n], non_blocking=True)
+        return gpu[:n]
+
+    def _stage_2d(self, key: str, rows: list, dtype) -> torch.Tensor:
+        r = len(rows)
+        c = max(len(x) for x in rows) if rows else 1
+        entry = self._stage.get(key)
+        if entry is None or entry[0].shape[0] < r or entry[0].shape[1] < c:
+            cpu = torch.empty(max(r, 8), max(c, 64), dtype=dtype, pin_memory=True)
+            gpu = torch.empty(cpu.shape, dtype=dtype, device=f'cuda:{self.rank}')
+            self._stage[key] = entry = (cpu, gpu)
+        cpu, gpu = entry
+        cpu[:r, :c].copy_(torch.tensor(rows, dtype=dtype))
+        gpu[:r, :c].copy_(cpu[:r, :c], non_blocking=True)
+        return gpu[:r, :c]
+
+    def _tokens_to_list(self, gpu_tokens: torch.Tensor) -> list[int]:
+        n = gpu_tokens.numel()
+        entry = self._stage.get("tok_out")
+        if entry is None or entry[0].numel() < n:
+            cpu = torch.empty(max(n, 64), dtype=gpu_tokens.dtype, pin_memory=True)
+            self._stage["tok_out"] = entry = (cpu, None)
+        cpu = entry[0]
+        cpu[:n].copy_(gpu_tokens)  # blocking D2H into pinned memory
+        return cpu[:n].tolist()
+
     def prepare_decode(self, seqs: list[Sequence]) -> torch.Tensor:
         input_ids = []
         context_lens = []
@@ -380,22 +419,22 @@ class ModelRunner:
             table = getattr(seq, self.table_attr)
             block_table = table + [-1]*(max_num_blocks - len(table))
             block_tables.append(block_table)
-        input_ids = torch.tensor(input_ids, dtype=torch.long, pin_memory=True).cuda(non_blocking=True)
+        input_ids = self._stage_1d("dec_in", input_ids, torch.long)
         set_context(
             is_prefill=False,
             cu_seqlens_q=None,
             cu_seqlens_k=None,
             max_seqlen_q=0,
             max_seqlen_k=0,
-            slot_mapping=torch.tensor(slot_mappings, dtype=torch.long, pin_memory=True).cuda(non_blocking=True),
-            context_lens=torch.tensor(context_lens, dtype=torch.long, pin_memory=True).cuda(non_blocking=True),
-            block_tables=torch.tensor(block_tables, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True) if block_tables else None,
+            slot_mapping=self._stage_1d("dec_slot", slot_mappings, torch.long),
+            context_lens=self._stage_1d("dec_ctx", context_lens, torch.long),
+            block_tables=self._stage_2d("dec_bt", block_tables, torch.int32) if block_tables else None,
         )
-        return input_ids    
+        return input_ids
 
     # prepare the temperature
     def prepare_sample(self, seqs: list[Sequence]) -> None:
-        return torch.tensor([seq.temperature for seq in seqs], dtype=torch.float32, pin_memory=True).cuda(non_blocking=True)
+        return self._stage_1d("temps", [seq.temperature for seq in seqs], torch.float32)
 
     # prepare inputs for a speculative-decoding verification forward.
     # every sequence carries K_i draft tokens appended to token_ids; the
@@ -496,26 +535,30 @@ class ModelRunner:
     # run model
     # sample logits
     # reset context
-    def run(self, seqs: list[Sequence], is_prefill: bool):
+    def run(self, seqs: list[Sequence], is_prefill: bool, temperatures=None):
         if is_prefill:
             input_ids = self.prepare_prefill(seqs)
         else:
             input_ids = self.prepare_decode(seqs)
-        temperatures = self.prepare_sample(seqs)
+        if temperatures is None:
+            temperatures = self.prepare_sample(seqs)
         logits_or_tokens = self.run_model(input_ids, is_prefill, temperatures)
         # only sample when rank == 0; tokens must come back as plain CPU ints
         # so scheduler bookkeeping never touches CUDA tensors
         token_ids = None
         if self.rank == 0:
             if isinstance(logits_or_tokens, tuple):
-                # (sampled_tokens, captured_logits) from a draft-model graph
+                # (sampled_tokens, captured_logits) from a draft-model graph;
+                # clone the logits — the static graph buffer is overwritten
+                # by the next draft step, stored views would corrupt p_d
                 sampled, logits = logits_or_tokens
                 reset_context()
-                return sampled.tolist(), logits
+                return self._tokens_to_list(sampled), logits.clone()
             if is_prefill or self.enforce_eager:
-                token_ids = self.sampler(logits_or_tokens, temperatures).tolist()
+                token_ids = self._tokens_to_list(
+                    self.sampler(logits_or_tokens, temperatures))
             else:
-                token_ids = logits_or_tokens.tolist()
+                token_ids = self._tokens_to_list(logits_or_tokens)
         reset_context()
         return token_ids
 

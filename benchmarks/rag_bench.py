@@ -69,6 +69,13 @@ SYSTEM = (
     "document. Reply with the exact words of the document, as a short quote."
 )
 
+# answers must be GENERATED (paraphrase/comparison), not copied — this
+# collapses n-gram drafting and is where a model drafter can pay off
+REASONING_SYSTEM = (
+    "You are a careful analyst. Answer with your own analysis and wording. "
+    "Do NOT copy sentences from the document."
+)
+
 
 def build_document(tokenizer, target_tokens: int) -> tuple[str, list[tuple[str, str]]]:
     """Deterministic pseudo-wiki document padded to ~target_tokens."""
@@ -98,24 +105,37 @@ def build_document(tokenizer, target_tokens: int) -> tuple[str, list[tuple[str, 
     return text, facts
 
 
-def build_prompts(tokenizer, doc: str, facts, num_questions: int):
+def build_prompts(tokenizer, doc: str, facts, num_questions: int,
+                  style: str = "extractive"):
+    """style: extractive (answers quote the doc — n-gram friendly),
+    reasoning (answers must be generated — model-drafter friendly),
+    mixed (alternates the two; the hybrid drafter's home turf)."""
     prompts, meta = [], []
     for i in range(num_questions):
         subject, fact = facts[(i * 3) % len(facts)]
-        question = (
-            f"Document: {doc}\n\nQuestion: What do the records state about "
-            f"{subject}? Answer:"
-        )
+        other, _ = facts[(i * 5 + 1) % len(facts)]
+        reasoning = style == "reasoning" or (style == "mixed" and i % 2 == 1)
+        if reasoning:
+            system, question = REASONING_SYSTEM, (
+                f"Document: {doc}\n\nQuestion: Compare \"{subject}\" and "
+                f"\"{other}\" based on the document, then summarize the "
+                f"difference in your own words. Do not quote the document."
+            )
+        else:
+            system, question = SYSTEM, (
+                f"Document: {doc}\n\nQuestion: What do the records state "
+                f"about {subject}? Answer:"
+            )
         chat = tokenizer.apply_chat_template(
             [
-                {"role": "system", "content": SYSTEM},
+                {"role": "system", "content": system},
                 {"role": "user", "content": question},
             ],
             tokenize=False,
             add_generation_prompt=True,
         )
         prompts.append(tokenizer(chat, add_special_tokens=False)["input_ids"])
-        meta.append({"subject": subject, "expected": fact})
+        meta.append({"subject": subject, "expected": fact, "style": "reasoning" if reasoning else "extractive"})
     return prompts, meta
 
 
@@ -310,7 +330,7 @@ def run_worker(args) -> dict[str, Any]:
     from transformers import AutoTokenizer
     TOKENIZER = AutoTokenizer.from_pretrained(args.model)
     doc, facts = build_document(TOKENIZER, args.doc_tokens)
-    prompts, meta = build_prompts(TOKENIZER, doc, facts, args.questions)
+    prompts, meta = build_prompts(TOKENIZER, doc, facts, args.questions, args.answer_style)
 
     # prime the shared document prefix so measured requests are "warm",
     # which is the realistic steady state of a knowledge-base assistant
@@ -340,6 +360,7 @@ def run_worker(args) -> dict[str, Any]:
         "backend": args.worker_backend,
         "init_s": init_s,
         "doc_tokens": args.doc_tokens,
+        "answer_style": args.answer_style,
         "max_tokens": args.max_tokens,
         "rows": rows,
     }
@@ -359,6 +380,7 @@ def main():
     parser.add_argument("--max-tokens", type=int, default=48)
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--k", type=int, default=5)
+    parser.add_argument("--answer-style", default="extractive", choices=("extractive", "reasoning", "mixed"))
     parser.add_argument("--naiv-method", default="ngram", choices=("ngram", "model", "hybrid", "none"))
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.6)
     parser.add_argument("--gpu", type=int, default=1)

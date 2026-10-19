@@ -114,21 +114,21 @@ class ModelDrafter:
         self.runner.call("run", seqs, True)
 
     def draft(self, seqs: list[Sequence]) -> tuple[list[list[int]], list]:
-        """Run K draft decode steps; returns (draft_tokens, draft_logits).
+        """Run K draft decode steps; returns (draft_tokens, draft_logit_rows).
 
         Drafted tokens are appended to seq.token_ids (rolled back by the
         engine after verification) and their distributions are kept for
-        rejection sampling.
+        rejection sampling. The hot path is per-round amortized: capacity is
+        ensured once for all K steps and the temperature tensor is built once.
         """
         k = self.num_speculative_tokens
+        for seq in seqs:
+            self.block_manager.ensure_capacity(seq, len(seq) + k + 1)
+        temperatures = self.runner.prepare_sample(seqs)
         draft_tokens = [[] for _ in seqs]
         draft_logit_rows = [[] for _ in seqs]
         for _ in range(k):
-            for seq in seqs:
-                self.block_manager.ensure_capacity(seq, len(seq) + 1)
-            outputs = self.runner.call("run", seqs, False)
-            tokens, logits = outputs
-            tokens = tokens.tolist() if hasattr(tokens, "tolist") else tokens
+            tokens, logits = self.runner.call("run", seqs, False, temperatures)
             for i, (seq, token) in enumerate(zip(seqs, tokens)):
                 seq.append_token(token)
                 seq.draft_tokens.append(token)
