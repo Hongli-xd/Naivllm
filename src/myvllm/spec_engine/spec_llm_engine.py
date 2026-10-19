@@ -25,7 +25,7 @@ from myvllm.engine.block_manager import BlockManager
 from myvllm.engine.model_runner import ModelRunner
 from myvllm.engine.sequence import SequenceStatus
 from myvllm.sampling_parameters import SamplingParams
-from myvllm.spec_engine.drafters import NgramDrafter, ModelDrafter
+from myvllm.spec_engine.drafters import NgramDrafter, ModelDrafter, HybridDrafter
 from myvllm.spec_engine.rejection_sampler import RejectionSampler
 
 
@@ -64,7 +64,7 @@ class SpecLLMEngine(LLMEngine):
             "fallback_rounds": 0,
         }
 
-        if self.spec_method == "model":
+        if self.spec_method in ("model", "hybrid"):
             draft_config = dict(config)
             draft_config.update(
                 model_name_or_path=config.get("draft_model"),
@@ -77,9 +77,21 @@ class SpecLLMEngine(LLMEngine):
                 dist_port=config.get("dist_port", 12345) + 1,
             )
             self._build_draft_runner(draft_config)
-            self.drafter = ModelDrafter(
+            model_drafter = ModelDrafter(
                 self.draft_runner, self.draft_block_manager, self.num_speculative_tokens
             )
+            if self.spec_method == "model":
+                self.drafter = model_drafter
+            else:
+                # cascade: free n-gram lookup first, small-model fallback
+                self.drafter = HybridDrafter(
+                    NgramDrafter(
+                        num_speculative_tokens=self.num_speculative_tokens,
+                        min_ngram_size=config.get("ngram_min_size", 2),
+                        max_ngram_size=config.get("ngram_max_size", 8),
+                    ),
+                    model_drafter,
+                )
         elif self.spec_method == "ngram":
             self.drafter = NgramDrafter(
                 num_speculative_tokens=self.num_speculative_tokens,
@@ -104,7 +116,17 @@ class SpecLLMEngine(LLMEngine):
         )
         assert base["vocab_size"] == self.model_runner.config["vocab_size"], \
             "draft and target models must share the tokenizer/vocabulary"
-        base.update(draft_config)
+        # apply only RUNTIME overrides from the caller config — the draft's
+        # architecture fields (hidden_size / intermediate_size / ...) come
+        # from its own checkpoint above; a blanket update would silently
+        # rebuild the draft with the TARGET's shape and fail weight loading
+        runtime_keys = (
+            "max_num_sequences", "max_num_batched_tokens", "max_model_length",
+            "block_size", "gpu_memory_utilization", "enforce_eager",
+            "seq_table_attr", "seq_cached_attr", "capture_logits",
+            "world_size", "dist_port", "num_spec_tokens",
+        )
+        base.update({k: v for k, v in draft_config.items() if k in runtime_keys})
         # per-draft-step block bookkeeping happens through draft_block_table
         self.draft_block_manager = BlockManager(
             base["max_cached_blocks"],
@@ -122,10 +144,11 @@ class SpecLLMEngine(LLMEngine):
 
         if is_prefill:
             outputs = self.model_runner.call("run", scheduled_sequences, True)
-            if isinstance(self.drafter, ModelDrafter):
+            prefill_hook = getattr(self.drafter, "prefill", None)
+            if callable(prefill_hook):
                 # mirror the prompt prefill into the draft KV cache before
                 # the first completion token is appended
-                self.drafter.prefill(scheduled_sequences)
+                prefill_hook(scheduled_sequences)
             self.scheduler.postprocess(scheduled_sequences, outputs)
         elif self.drafter is not None:
             self._speculative_step(scheduled_sequences)
@@ -151,7 +174,8 @@ class SpecLLMEngine(LLMEngine):
         block_manager = self.scheduler.block_manager
         if not all(block_manager.can_ensure_capacity(seq, len(seq) + K) for seq in seqs):
             return False
-        if isinstance(self.drafter, ModelDrafter) and not self.drafter.can_draft(seqs, K):
+        can_draft = getattr(self.drafter, "can_draft", None)
+        if callable(can_draft) and not can_draft(seqs, K):
             return False
         return True
 
@@ -165,16 +189,9 @@ class SpecLLMEngine(LLMEngine):
 
         K = self.num_speculative_tokens
 
-        # ---- 1. drafting
-        if isinstance(self.drafter, NgramDrafter):
-            draft_lists = self.drafter.draft(scheduled_sequences)
-            draft_logit_rows = [None] * len(scheduled_sequences)
-            for seq, drafted in zip(scheduled_sequences, draft_lists):
-                seq.draft_tokens = list(drafted)
-                for token in drafted:
-                    seq.append_token(token)
-        else:
-            draft_lists, draft_logit_rows = self.drafter.draft(scheduled_sequences)
+        # ---- 1. drafting (uniform interface: every drafter appends its
+        # draft tokens onto the sequences itself and returns aligned rows)
+        draft_lists, draft_logit_rows = self.drafter.draft(scheduled_sequences)
 
         stats = self.spec_stats
         stats["rounds"] += 1
@@ -276,5 +293,9 @@ class SpecLLMEngine(LLMEngine):
     # ---------------------------------------------------------------- metrics
     def _generate(self, request_ids):
         result = super()._generate(request_ids)
-        result["metrics"]["spec_decoding"] = dict(self.spec_stats)
+        stats = dict(self.spec_stats)
+        if isinstance(self.drafter, HybridDrafter):
+            stats["model_fallback_rounds"] = self.drafter.model_rounds
+            stats["model_fallback_seqs"] = self.drafter.model_seqs
+        result["metrics"]["spec_decoding"] = stats
         return result

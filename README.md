@@ -25,6 +25,29 @@ bounds; Ollama runs fp16 on a dedicated GPU-pinned server.
 | 8     | 1148         | 1151               | 2285      | 2248        | 164    |
 | cold start | —       | **3.1 s**          | 44.9 s    | 44.9 s      | resident |
 
+### Model-draft speculation (0.6B → 1.7B), same RAG workload
+
+| backend | b1 | b2 | b4 | b8 (tok/s) |
+|---|---:|---:|---:|---:|
+| NaivLLM plain 1.7B | 97 | 198 | 276 | 685 |
+| **NaivLLM +ngram** | **171** | **297** | 405 | 632 |
+| NaivLLM +model-draft | 65 | 102 | 196 | 347 |
+| NaivLLM +hybrid (cascade) | 110 | 176 | 281 | 386 |
+| vLLM 1.7B plain | 182 | 294 | 540 | 1046 |
+| vLLM +draft-model spec | 31 | 101 | 185 | 323 |
+
+- n-gram speculation still wins on the bigger target (**1.76×** self-speedup
+  at batch 1) and **beats vLLM's draft-model speculation 5.6×** (171 vs 31
+  tok/s) — in the launch-bound small-model regime the draft's forward is
+  nearly as expensive as the target's, so any draft-model scheme (ours
+  included) loses; a zero-cost n-gram drafter is the right tool.
+- All three speculative modes (ngram / model / hybrid) are verified
+  **token-identical** to plain decoding on this combination; the hybrid
+  cascade demonstrably fires (8–13 model-fallback rounds per run) and its
+  value domain is larger targets with comparatively cheaper drafts.
+- Shared-GPU note: a neighbor process held ~23 GB during this suite; all
+  six backends ran back-to-back under identical conditions.
+
 ![throughput](docs/rag-throughput.png)
 
 - **vs Ollama (the single-user small-model baseline): 4.8×–7.0× across every

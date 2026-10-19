@@ -25,7 +25,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", required=True)
     parser.add_argument("--draft-model", default=None)
-    parser.add_argument("--method", choices=("ngram", "model", "none"), default="ngram")
+    parser.add_argument("--method", choices=("ngram", "model", "hybrid", "none"), default="ngram")
     parser.add_argument("--k", type=int, default=5, help="speculative tokens per round")
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--max-tokens", type=int, default=64)
@@ -49,6 +49,9 @@ def main():
     )
     if args.draft_model:
         config["draft_model"] = args.draft_model
+        if args.method == "hybrid":
+            config["draft_gpu_memory_utilization"] = 0.25
+            config["target_gpu_memory_utilization"] = 0.55
 
     if args.method == "none":
         from myvllm.engine.llm_engine import LLMEngine

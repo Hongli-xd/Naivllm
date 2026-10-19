@@ -141,7 +141,7 @@ class NaivBackend:
             ngram_min_size=2,
             ngram_max_size=8,
         )
-        if args.naiv_method == "model":
+        if args.naiv_method in ("model", "hybrid"):
             config["draft_model"] = args.draft_model
             config["draft_gpu_memory_utilization"] = 0.25
             config["target_gpu_memory_utilization"] = args.gpu_memory_utilization - 0.25
@@ -178,12 +178,18 @@ class NaivBackend:
 
 
 class VllmBackend:
-    def __init__(self, args, spec: bool):
+    def __init__(self, args, spec):
         import vllm
         from transformers import AutoConfig, AutoTokenizer
         self.tokenizer = AutoTokenizer.from_pretrained(args.model)
         self.speculative_config = None
-        if spec:
+        if spec == "draft":
+            # draft-model speculation: vLLM infers the method from "model"
+            self.speculative_config = {
+                "model": args.draft_model,
+                "num_speculative_tokens": args.k,
+            }
+        elif spec:
             self.speculative_config = {
                 "method": "ngram",
                 "num_speculative_tokens": args.k,
@@ -294,6 +300,8 @@ def run_worker(args) -> dict[str, Any]:
         backend = VllmBackend(args, spec=False)
     elif args.worker_backend == "vllm-spec":
         backend = VllmBackend(args, spec=True)
+    elif args.worker_backend == "vllm-draft":
+        backend = VllmBackend(args, spec="draft")
     elif args.worker_backend == "ollama":
         backend = OllamaBackend(args)
     init_s = time.perf_counter() - init_t0
@@ -351,7 +359,7 @@ def main():
     parser.add_argument("--max-tokens", type=int, default=48)
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--k", type=int, default=5)
-    parser.add_argument("--naiv-method", default="ngram", choices=("ngram", "model", "none"))
+    parser.add_argument("--naiv-method", default="ngram", choices=("ngram", "model", "hybrid", "none"))
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.6)
     parser.add_argument("--gpu", type=int, default=1)
     parser.add_argument("--output", default="benchmark-results/rag.json")
