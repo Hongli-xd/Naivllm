@@ -64,6 +64,23 @@ bounds; Ollama runs fp16 on a dedicated GPU-pinned server.
 ![spec decode](docs/rag-spec-decode.png)
 ![cold start](docs/rag-coldstart.png)
 
+### Drafter regime map (0.6B draft, single 4090, batch 1)
+
+| target | n-gram | model-draft | hybrid | verdict |
+|---|---|---|---|---|
+| 1.7B | **+76%** | −33% | −31% | n-gram only |
+| 4B  | **+18~23%** | −15% | −17% | n-gram only |
+| 8B  | **+29~50%** | −1%~**+49%** | +6~**+38%** | crossover — model pays |
+
+Measured across extractive/reasoning/mixed answer styles (each vs its own
+plain baseline). The breakeven algebra `accepted/round > K·(draft_step/
+target_step) + 1.2` puts the crossover between 4B and 8B for a 0.6B draft
+on this GPU — confirmed on both sides. Notable: when a model stops quoting
+the doc, the n-gram drafter degrades gracefully into a "free bonus token
+per round" mode that never goes negative; vLLM's draft-model spec only
+turns on at 8B too (+81% with its async draft worker — our synchronous
+draft loop is the gap to close). Full JSONs: `benchmark-results/q*_b-*`.
+
 ## Speculative decoding (`myvllm/spec_engine`)
 
 Lossless speculative decoding (Leviathan et al. 2023), mirroring vLLM's
