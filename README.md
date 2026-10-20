@@ -64,6 +64,21 @@ bounds; Ollama runs fp16 on a dedicated GPU-pinned server.
 ![spec decode](docs/rag-spec-decode.png)
 ![cold start](docs/rag-coldstart.png)
 
+### Two-scale head-to-head (RAG grounded QA, one GPU, greedy)
+
+| scale (draft = 0.6B) | Ollama fp16 | vLLM 0.23 | vLLM +spec | **NaivLLM** |
+|---|---:|---:|---:|---:|
+| Qwen3-0.6B +n-gram, batch 1 | 82 | 385 | — | **265** |
+| Qwen3-0.6B +n-gram, batch 8 | 214 | 1408 | — | **800** |
+| Qwen3-8B +hybrid, batch 1 | 26 | 33 | 66 | **79** |
+| Qwen3-8B +hybrid, batch 8 | 91 | 266 | 386 | **276** |
+
+Same weights (bf16/fp16), same tokenized prompts, same GPU, greedy;
+vLLM runs identical speculative parameters (n-gram at 0.6B, draft-model
+at 8B); Ollama runs fp16 with its best available settings (no spec
+decoding exists for it). Back-to-back on one GPU. Full JSONs in
+`benchmark-results/u06-*/u8-*`.
+
 ### Drafter regime map (0.6B draft, single 4090, batch 1)
 
 | target | n-gram | model-draft | hybrid | verdict |
